@@ -18,6 +18,7 @@ import {
   latestByType,
   listOf,
   pageOf,
+  serialOf,
   tidy,
 } from './format.js';
 import type { DeviceRow } from './format.js';
@@ -167,7 +168,7 @@ async function getDevice(args: Raw, api: Api) {
   } catch (err) {
     // Some accounts answer the list but not the single device; fall back to the list.
     const { devices } = await allDevices(api);
-    raw = devices.find((d) => String(d.sn ?? '').toUpperCase() === sn);
+    raw = devices.find((d) => serialOf(d) === sn);
     if (!raw) throw err;
   }
   const [backup, asset] = await Promise.all([

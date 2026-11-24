@@ -264,6 +264,19 @@ describe('FortiGate Cloud devices', () => {
     expect(bad.structuredContent).toMatchObject({ error_type: 'invalid_input' });
     expect(calls.length).toBe(before);
   });
+  it('one device: when /devices/{sn} fails, the list is searched by any serial field (sn or serialNumber)', async () => {
+    const { fn } = fakeForticloud({
+      [`${FGT}/devices`]: json([{ serialNumber: 'fgt60ftk00000007', name: 'by-serialNumber', tunnelAlive: false }]),
+      [`${FGT}/subaccounts`]: json([]),
+      [`${FGT}/devices/FGT60FTK00000007`]: json({ error: 'not found' }, 404),
+      [`${FGT}/devices/FGT60FTK00000007/configbackups/setting`]: json({ enabled: false }),
+    });
+    setFetchForTests(fn);
+    const out = dataOf(await call('forticloud_get_device', { serial: 'FGT60FTK00000007', include_asset: false }));
+    expect(out).toMatchObject({ serial: 'FGT60FTK00000007', name: 'by-serialNumber', connection: 'offline' });
+    const missing = await call('forticloud_get_device', { serial: 'FGT60FTK00000099', include_asset: false });
+    expect(missing.isError).toBe(true);
+  });
   it('firmware summary: oldest version first, per major version', async () => {
     const { fn } = fakeForticloud(fgtRoutes());
     setFetchForTests(fn);

@@ -143,6 +143,19 @@ export function lastSeenOf(d: Raw): string | undefined {
   return undefined;
 }
 
+/**
+ * A device's serial, upper case, from whichever field FortiGate Cloud uses
+ * (`sn` in the documented sample; `serialNumber` or `serial` elsewhere);
+ * '' when there is none. Every lookup and de-duplication goes through this.
+ */
+export function serialOf(d: Raw): string {
+  for (const v of [d.sn, d.serialNumber, d.serial]) {
+    if (typeof v === 'string' && v.trim()) return v.trim().toUpperCase();
+    if (typeof v === 'number') return String(v);
+  }
+  return '';
+}
+
 export interface DeviceRow {
   serial: string;
   name?: string;
@@ -162,7 +175,7 @@ export interface DeviceRow {
 export function deviceRow(d: Raw, accounts?: Map<number, string>): DeviceRow {
   const accountId = num(d.subAccountOid ?? d.subAccountId ?? d.accountId);
   return compact({
-    serial: clean(d.sn ?? d.serialNumber ?? d.serial, 40) ?? '?',
+    serial: clean(serialOf(d), 40) ?? '?',
     name: clean(d.name ?? d.hostname ?? d.hostName, 120),
     model: clean(d.model ?? d.platform, 60),
     firmware: clean(d.firmwareVersion ?? d.firmware ?? d.version, 40),
@@ -222,7 +235,7 @@ export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolea
       const items = listOf(await api.fgt('/devices', { limit: DEVICE_PAGE, offset: page * DEVICE_PAGE }));
       const before = seen.size;
       for (const d of items) {
-        const sn = String(d.sn ?? d.serialNumber ?? '');
+        const sn = serialOf(d);
         if (sn && !seen.has(sn)) seen.set(sn, d);
         const t = num(d.total);
         if (t !== undefined) total = Math.max(total ?? 0, t);
