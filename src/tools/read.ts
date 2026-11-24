@@ -22,6 +22,7 @@ import {
   tidy,
 } from './format.js';
 import type { DeviceRow } from './format.js';
+import { ForticloudRateLimitError } from '../types.js';
 import { InputError, clean, compact, num } from './shared.js';
 import type { ParamSpec, ToolSpec } from './spec.js';
 
@@ -57,8 +58,21 @@ const int = (v: unknown) => v as number | undefined;
 /** Largest number of Asset Management pages (25 assets each) one call reads. */
 const MAX_ASSET_PAGES = 12;
 
-/** Errors from one part of a result, kept short; the rest of the result still stands. */
-const partError = (err: unknown) => clean((err as Error).message, 300) ?? 'failed';
+/**
+ * Errors from one part of a result, kept short; the rest of the result still
+ * stands. A rate limit is the exception: it is rethrown, so the call stops at
+ * once (no more requests during the cooldown) and runSpec returns the
+ * structured rate_limited error with the wait. Every catch in these tools goes
+ * through this or rethrowRateLimit.
+ */
+function partError(err: unknown): string {
+  rethrowRateLimit(err);
+  return clean((err as Error).message, 300) ?? 'failed';
+}
+
+function rethrowRateLimit(err: unknown): void {
+  if (err instanceof ForticloudRateLimitError) throw err;
+}
 
 // --- FortiGate Cloud ---------------------------------------------------------------------------
 
@@ -187,6 +201,7 @@ async function getDevice(args: Raw, api: Api) {
     const body = await api.fgt(`/devices/${sn}`);
     raw = (Array.isArray(body) ? body[0] : (body as Raw)?.data ?? body) as Raw;
   } catch (err) {
+    rethrowRateLimit(err);
     // Some accounts answer the list but not the single device; fall back to the list.
     const { devices, complete } = await allDevices(api);
     raw = devices.find((d) => serialOf(d) === sn);
@@ -255,7 +270,11 @@ async function configBackupStatus(args: Raw, api: Api) {
   let complete = true;
   if (str(args.serial) !== undefined) {
     const sn = checkSerial(args.serial);
-    const { rows } = await devicesWithAccounts(api).catch(() => ({ rows: [] as DeviceRow[] }));
+    // The list only adds the name and account; without it the one device is still read.
+    const { rows } = await devicesWithAccounts(api).catch((err) => {
+      rethrowRateLimit(err);
+      return { rows: [] as DeviceRow[] };
+    });
     targets = [rows.find((r) => r.serial.toUpperCase() === sn) ?? { serial: sn, connection: 'unknown' }];
     total = 1;
   } else {

@@ -1,4 +1,5 @@
 import type { Api } from '../client.js';
+import { ForticloudRateLimitError } from '../types.js';
 import { InputError, clean, compact, num } from './shared.js';
 
 type Raw = Record<string, unknown>;
@@ -258,7 +259,11 @@ export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolea
   return value;
 }
 
-/** FortiGate Cloud sub-accounts (an MSSP's client accounts) by ID; null when the API refuses. */
+/**
+ * FortiGate Cloud sub-accounts (an MSSP's client accounts) by ID; null when the
+ * API refuses. A rate limit is never turned into null: it is thrown, so the
+ * call stops and reports the wait, and it is not cached.
+ */
 export function accountNames(api: Api): Promise<Map<number, string> | null> {
   const key = api.cacheKey;
   const hit = accountCache.get(key);
@@ -274,8 +279,12 @@ export function accountNames(api: Api): Promise<Map<number, string> | null> {
       }
       return map;
     })
-    .catch(() => null);
+    .catch((err) => {
+      if (err instanceof ForticloudRateLimitError) throw err;
+      return null;
+    });
   accountCache.set(key, { at: Date.now(), value });
+  value.catch(() => accountCache.delete(key));
   return value;
 }
 

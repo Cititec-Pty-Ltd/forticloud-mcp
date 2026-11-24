@@ -159,6 +159,90 @@ describe('rate limits (fleet 429 policy)', () => {
   });
 });
 
+describe('a 429 is never swallowed by a partial result', () => {
+  const limited = () => json({ message: 'Too many requests' }, 429, { 'Retry-After': '120' });
+  const expectRateLimited = (res: any) => {
+    expect(res.isError).toBe(true);
+    expect(textOf(res)).toMatch(/Try again in 120 s\./);
+    expect(res.structuredContent).toEqual({ error_type: 'rate_limited', retry_after_seconds: 120 });
+  };
+
+  it('the backup audit stops at the first rate-limited device', async () => {
+    const many = Array.from({ length: 4 }, (_, i) => ({ sn: `FGT60FTK0000002${i}`, name: `fw${i}`, tunnelAlive: true }));
+    const { fn, calls } = fakeForticloud({
+      [`${FGT}/devices`]: json(many),
+      [`${FGT}/subaccounts`]: json([]),
+      [`${FGT}/devices/FGT60FTK00000020/configbackups/setting`]: json({ enabled: true }),
+      [`${FGT}/devices/FGT60FTK00000021/configbackups/setting`]: limited(),
+    });
+    setFetchForTests(fn);
+    expectRateLimited(await call('forticloud_config_backup_status'));
+    const settings = calls.filter((c) => c.url.pathname.endsWith('/configbackups/setting')).map((c) => c.url.pathname.split('/')[4]);
+    expect(settings).toEqual(['FGT60FTK00000020', 'FGT60FTK00000021']);
+  });
+
+  const cases: [string, Record<string, unknown>, Record<string, any>][] = [
+    ['status (FortiGate Cloud part)', {}, { [`${FGT}/devices`]: limited(), [`${ASSET}/folders/list`]: json({ status: 0, folders: [] }) }],
+    ['status (Asset Management part)', {}, { [`${ASSET}/folders/list`]: limited() }],
+    ['list_accounts (device counts)', {}, { [`${FGT}/devices`]: limited() }],
+    ['list_devices (sub-account names)', {}, { [`${FGT}/subaccounts`]: limited() }],
+    ['get_device (the device)', { serial: 'FGT60FTK00000001', include_asset: false }, { [`${FGT}/devices/FGT60FTK00000001`]: limited() }],
+    [
+      'get_device (backup settings part)',
+      { serial: 'FGT60FTK00000001', include_asset: false },
+      { [`${FGT}/devices/FGT60FTK00000001`]: json(DEVICES[0]), [`${FGT}/devices/FGT60FTK00000001/configbackups/setting`]: limited() },
+    ],
+    [
+      'get_device (Asset Management part)',
+      { serial: 'FGT60FTK00000001' },
+      {
+        [`${FGT}/devices/FGT60FTK00000001`]: json(DEVICES[0]),
+        [`${FGT}/devices/FGT60FTK00000001/configbackups/setting`]: json({}),
+        [`${ASSET}/products/details`]: limited(),
+      },
+    ],
+    ['config_backup_status (one serial, device list)', { serial: 'FGT60FTK00000001' }, { [`${FGT}/devices`]: limited() }],
+    ['search (devices part)', { query: 'client', include_assets: false }, { [`${FGT}/devices`]: limited() }],
+    ['search (Asset Management part)', { query: 'FGT60FTK0000000' }, { [`${ASSET}/products/list`]: limited() }],
+  ];
+  const tools: Record<string, string> = {
+    status: 'forticloud_status',
+    list_accounts: 'forticloud_list_accounts',
+    list_devices: 'forticloud_list_devices',
+    get_device: 'forticloud_get_device',
+    config_backup_status: 'forticloud_config_backup_status',
+    search: 'forticloud_search',
+  };
+  for (const [label, args, routes] of cases) {
+    it(`${label}: rate_limited, not a partial result`, async () => {
+      const { fn } = fakeForticloud({
+        ...fgtRoutes(),
+        [`${FGT}/devices/FGT60FTK00000001/configbackups/setting`]: json({}),
+        ...routes,
+      });
+      setFetchForTests(fn);
+      expectRateLimited(await call(tools[label.split(' ')[0]], args));
+    });
+  }
+
+  it('get_device does not fall back to the device list after a 429', async () => {
+    const { fn, calls } = fakeForticloud(fgtRoutes({ [`${FGT}/devices/FGT60FTK00000001`]: limited() }));
+    setFetchForTests(fn);
+    await call('forticloud_get_device', { serial: 'FGT60FTK00000001', include_asset: false });
+    expect(calls.some((c) => c.url.pathname.endsWith('/forticloudapi/v1/devices'))).toBe(false);
+  });
+
+  it('a rate-limited sub-account lookup is not cached', async () => {
+    let n = 0;
+    const { fn } = fakeForticloud(fgtRoutes({ [`${FGT}/subaccounts`]: () => (n++ === 0 ? limited() : json(SUBACCOUNTS)) }));
+    setFetchForTests(fn);
+    expectRateLimited(await call('forticloud_list_devices'));
+    const out = dataOf(await call('forticloud_list_devices'));
+    expect(out.devices.find((d: any) => d.accountId === 100).account).toBe('Example Client A');
+    expect(n).toBe(2);
+  });
+});
+
 describe('FortiGate Cloud devices', () => {
   it('lists devices with connection and account, offline first, with paging', async () => {
     const { fn } = fakeForticloud(fgtRoutes());
