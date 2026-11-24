@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULTS, getConfig, parseBaseUrl, runWithConfig, scrub, setFetchForTests } from '../client.js';
 import { ALL_TOOLS, READ_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
-import { clearCaches, compareFirmware, daysLeft, expireBefore, expiryOf, latestByType, parseDate } from '../tools/format.js';
+import { ZONELESS_DATE, clearCaches, compareFirmware, day, daysLeft, expireBefore, expiryOf, latestByType, parseDate } from '../tools/format.js';
 import { wrapUntrusted } from '../tools/shared.js';
 import { ASSET, FGT, dataOf, fakeForticloud, json, textOf } from './test-helpers.js';
 import type { Call } from './test-helpers.js';
@@ -635,6 +635,46 @@ describe('expiry dates and time zones', () => {
     expect(melb.allEntitlements[0].daysLeft).toBe(utc.allEntitlements[0].daysLeft);
     expect(utc.endOfSupport).toBe('2030-01-01');
     expect(melb.endOfSupport).toBe('2030-01-01');
+  });
+
+  const ZONES = ['America/Los_Angeles', 'Australia/Melbourne', 'UTC'];
+
+  it('a date with no zone is shown as written in every zone (west and east of UTC)', () => {
+    for (const tz of ZONES) {
+      for (const v of ['2030-01-01', '2030-01-01T00:00:00', '2030-01-01T00:00:00.000', '2030-01-01T23:59']) {
+        expect([tz, v, day(v, tz)]).toEqual([tz, v, '2030-01-01']);
+      }
+    }
+  });
+
+  it('a moment (offset or epoch) is shown as its date in the zone', () => {
+    expect(day('2030-01-01T05:00:00Z', 'America/Los_Angeles')).toBe('2029-12-31');
+    expect(day('2030-01-01T05:00:00Z', 'Australia/Melbourne')).toBe('2030-01-01');
+    expect(day('2029-12-31T20:00:00-8:00', 'Australia/Melbourne')).toBe('2030-01-01');
+    expect(day(Date.parse('2030-01-01T05:00:00Z') / 1000, 'America/Los_Angeles')).toBe('2029-12-31');
+  });
+
+  it('the zone-less pattern matches digits, not the letter d', () => {
+    expect(ZONELESS_DATE.test('2030-01-01')).toBe(true);
+    expect(ZONELESS_DATE.test('2030-01-01T00:00:00')).toBe(true);
+    expect(ZONELESS_DATE.test('dddd-dd-dd')).toBe(false);
+    expect(ZONELESS_DATE.test('2030-01-01T00:00:00Z')).toBe(false);
+    expect(ZONELESS_DATE.test('2030-01-01T00:00:00-8:00')).toBe(false);
+  });
+
+  it('end of support (no zone) is the same date through the tool in Los Angeles and Melbourne', async () => {
+    const routes = {
+      [`${ASSET}/products/details`]: json({
+        status: 0,
+        assetDetails: { serialNumber: 'FGT60FTK00000001', productModelEoR: '2030-01-01', productModelEoS: '2030-01-01T00:00:00' },
+      }),
+    };
+    for (const tz of ['America/Los_Angeles', 'Australia/Melbourne']) {
+      process.env.FORTICLOUD_TIME_ZONE = tz;
+      setFetchForTests(fakeForticloud(routes).fn);
+      const out = dataOf(await call('forticloud_get_asset', { serial: 'FGT60FTK00000001' }));
+      expect([tz, out.endOfOrder, out.endOfSupport]).toEqual([tz, '2030-01-01', '2030-01-01']);
+    }
   });
 
   it('a bad FORTICLOUD_TIME_ZONE is a config error', async () => {

@@ -14,6 +14,12 @@ const DAY_MS = 86_400_000;
  * like "-8:00" (one-digit hour), which Date.parse rejects, so the offset is
  * padded first. Numbers are epoch seconds (or ms when that large). 0 is none.
  */
+/**
+ * A date with no time zone: "2030-01-01" or "2030-01-01T00:00:00[.000]". It is
+ * a calendar date: day() shows it as written, parseDate() reads it as UTC.
+ */
+export const ZONELESS_DATE = /^\d{4}-\d\d-\d\d(T\d\d:\d\d(:\d\d(\.\d+)?)?)?$/;
+
 export function parseDate(value: unknown): number | undefined {
   if (typeof value === 'number') {
     if (!Number.isFinite(value) || value <= 0) return undefined;
@@ -23,7 +29,7 @@ export function parseDate(value: unknown): number | undefined {
   const s = value.trim().replace(/([+-])(\d):(\d\d)$/, '$10$2:$3');
   if (/^\d+$/.test(s)) return parseDate(Number(s));
   // No zone given ("2030-01-01T00:00:00"): read as UTC, not as this machine's local time.
-  const zoned = /^\d{4}-\d\d-\d\d$/.test(s) ? `${s}T00:00:00Z` : /^\d{4}-\d\d-\d\dT[\d:.]+$/.test(s) ? `${s}Z` : s;
+  const zoned = ZONELESS_DATE.test(s) ? (s.length === 10 ? `${s}T00:00:00Z` : `${s}Z`) : s;
   const ms = Date.parse(zoned);
   return Number.isNaN(ms) ? undefined : ms;
 }
@@ -40,7 +46,7 @@ export function parseDate(value: unknown): number | undefined {
  * daysLeft never depends on the time zone; see daysLeft.
  */
 export function day(value: unknown, timeZone: string = displayTimeZone()): string | undefined {
-  if (typeof value === 'string' && /^d{4}-dd-dd(T[d:.]+)?$/.test(value.trim())) return value.trim().slice(0, 10);
+  if (typeof value === 'string' && ZONELESS_DATE.test(value.trim())) return value.trim().slice(0, 10);
   const ms = parseDate(value);
   if (ms === undefined) return undefined;
   // en-CA formats as YYYY-MM-DD.
