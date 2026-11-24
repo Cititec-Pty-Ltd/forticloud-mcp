@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULTS, getConfig, parseBaseUrl, runWithConfig, scrub, setFetchForTests } from '../client.js';
 import { ALL_TOOLS, READ_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
-import { clearCaches, compareFirmware, daysLeft, expireBefore, latestByType, parseDate } from '../tools/format.js';
+import { clearCaches, compareFirmware, daysLeft, expireBefore, expiryOf, latestByType, parseDate } from '../tools/format.js';
 import { wrapUntrusted } from '../tools/shared.js';
 import { ASSET, FGT, dataOf, fakeForticloud, json, textOf } from './test-helpers.js';
 import type { Call } from './test-helpers.js';
@@ -558,6 +558,98 @@ describe('status and search', () => {
     const bySerial = dataOf(await call('forticloud_search', { query: 'FGT60FTK0000000' }));
     expect(bySerial.fortigateCloudDevices).toHaveLength(2);
     expect(bySerial.assetManagement[0].serial).toBe('FGT60FTK00000001');
+  });
+});
+
+describe('expiry dates and time zones', () => {
+  afterEach(() => delete process.env.FORTICLOUD_TIME_ZONE);
+
+  it('a contract expiring later today shows daysLeft 0, the same as its entitlement', async () => {
+    const now = Date.now();
+    const later = iso(now + 60 * 60_000); // in an hour
+    const { fn } = fakeForticloud({
+      [`${ASSET}/contracts/list`]: json({ status: 0, contracts: [{ contractNumber: 'C0000001', terms: [{ supportType: 'Support', startDate: iso(now - 300 * DAY), endDate: later }] }] }),
+      [`${ASSET}/products/details`]: json({
+        status: 0,
+        assetDetails: {
+          serialNumber: 'FGT60FTK00000001',
+          entitlements: [{ typeDesc: 'Support', endDate: later }],
+          contracts: [{ contractNumber: 'C0000001', terms: [{ supportType: 'Support', endDate: later }] }],
+        },
+      }),
+    });
+    setFetchForTests(fn);
+    const contract = dataOf(await call('forticloud_list_contracts')).contracts[0];
+    expect(contract.daysLeft).toBe(0);
+    expect(contract.terms[0].daysLeft).toBe(0);
+    const asset = dataOf(await call('forticloud_get_asset', { serial: 'FGT60FTK00000001' }));
+    expect(asset.allEntitlements[0]).toMatchObject({ end: contract.end, daysLeft: 0 });
+    expect(asset.contracts[0].terms[0]).toMatchObject({ end: contract.end, daysLeft: 0 });
+  });
+
+  it('a contract ended an hour ago is -1; its latest term is chosen by time, not by text', async () => {
+    const now = Date.now();
+    const { fn } = fakeForticloud({
+      [`${ASSET}/contracts/list`]: json({
+        status: 0,
+        contracts: [
+          { contractNumber: 'C0000002', terms: [{ endDate: iso(now - 60 * 60_000) }] },
+          // As text, the +14:00 term sorts last, but the -8:00 term ends 20 hours later.
+          { contractNumber: 'C0000003', terms: [{ endDate: '2030-12-01T23:00:00-8:00' }, { endDate: '2030-12-02T01:00:00+14:00' }] },
+        ],
+      }),
+    });
+    setFetchForTests(fn);
+    const out = dataOf(await call('forticloud_list_contracts')).contracts;
+    expect(out.find((c: any) => c.contract === 'C0000002').daysLeft).toBe(-1);
+    const c3 = out.find((c: any) => c.contract === 'C0000003');
+    expect(c3.end).toBe('2030-12-02'); // 2030-12-02T07:00Z
+    expect(c3.daysLeft).toBe(daysLeft('2030-12-01T23:00:00-08:00', Date.now()));
+  });
+
+  it('dates are shown in FORTICLOUD_TIME_ZONE; daysLeft is the same in any zone; zone-less dates are as written', async () => {
+    const now = Date.now();
+    const end = new Date(now + 40 * DAY);
+    end.setUTCHours(20, 0, 0, 0); // 20:00 UTC = the next morning in Melbourne
+    const routes = {
+      [`${ASSET}/products/details`]: json({
+        status: 0,
+        assetDetails: {
+          serialNumber: 'FGT60FTK00000001',
+          productModelEoS: '2030-01-01T00:00:00',
+          entitlements: [{ typeDesc: 'Support', endDate: end.toISOString() }],
+        },
+      }),
+    };
+    const utcDay = end.toISOString().slice(0, 10);
+    const melbDay = new Date(end.getTime() + DAY).toISOString().slice(0, 10);
+
+    setFetchForTests(fakeForticloud(routes).fn);
+    const utc = dataOf(await call('forticloud_get_asset', { serial: 'FGT60FTK00000001' }));
+    process.env.FORTICLOUD_TIME_ZONE = 'Australia/Melbourne';
+    setFetchForTests(fakeForticloud(routes).fn);
+    const melb = dataOf(await call('forticloud_get_asset', { serial: 'FGT60FTK00000001' }));
+
+    expect(utc.allEntitlements[0].end).toBe(utcDay);
+    expect(melb.allEntitlements[0].end).toBe(melbDay);
+    expect(melb.allEntitlements[0].daysLeft).toBe(utc.allEntitlements[0].daysLeft);
+    expect(utc.endOfSupport).toBe('2030-01-01');
+    expect(melb.endOfSupport).toBe('2030-01-01');
+  });
+
+  it('a bad FORTICLOUD_TIME_ZONE is a config error', async () => {
+    process.env.FORTICLOUD_TIME_ZONE = 'Melbourne; rm -rf /';
+    const { fn } = fakeForticloud({});
+    setFetchForTests(fn);
+    const res = await call('forticloud_list_folders');
+    expect(res.structuredContent).toMatchObject({ error_type: 'config' });
+    expect(textOf(res)).toMatch(/not an IANA time zone/);
+    expect(fn).not.toHaveBeenCalled();
+  });
+
+  it('expiryOf picks the latest moment and keeps its own display date', () => {
+    expect(expiryOf([undefined, '2030-01-01T00:00:00Z', 'nonsense'], Date.parse('2029-12-31T00:00:00Z'))).toEqual({ end: '2030-01-01', daysLeft: 1 });
+    expect(expiryOf([])).toEqual({});
   });
 });
 

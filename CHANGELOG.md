@@ -20,6 +20,9 @@ and Asset Management), stdio transport.
   refused sign-in is not retried for 10 minutes (repeated failures can lock
   the API user out).
 - Endpoints and client IDs are settings with documented defaults.
+- `daysLeft` counts 24-hour periods to the exact expiry (time-zone independent);
+  dates are shown in `FORTICLOUD_TIME_ZONE` (default UTC). Contracts,
+  entitlements and licences share one expiry calculation.
 - Paged and bounded results; results with device-supplied text are wrapped in
   `<forticloud-data>` as untrusted data.
 - Fleet 429 policy: a read is retried once when the wait is 10 s or less,

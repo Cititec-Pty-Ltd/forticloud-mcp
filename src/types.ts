@@ -24,6 +24,11 @@ export interface ForticloudConfig {
   fgtUrl: string;
   assetClientId: string;
   fgtClientId: string;
+  /**
+   * IANA time zone that calendar dates are shown in (end dates, windows).
+   * daysLeft does not depend on it: it counts 24-hour periods to the exact expiry.
+   */
+  timeZone: string;
 }
 
 export type Portal = 'asset' | 'fgt';

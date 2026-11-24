@@ -1,5 +1,5 @@
 import type { Tool } from '@modelcontextprotocol/sdk/types.js';
-import { ConfigError, getConfig, makeApi, scrub } from '../client.js';
+import { ConfigError, getConfig, makeApi, runWithConfig, scrub } from '../client.js';
 import type { Api } from '../client.js';
 import { ForticloudAuthError, ForticloudRateLimitError } from '../types.js';
 import type { CallToolResult } from './types.js';
@@ -161,7 +161,9 @@ export async function runSpec(spec: ToolSpec, args: Record<string, unknown>): Pr
   if (!config) return missingConfigResult();
   try {
     const valid = validateArgs(spec, args);
-    const out = redactSecrets(await spec.run(valid, makeApi(config)));
+    const cfg = config;
+    // Inside the call's own config, so dates are shown in its FORTICLOUD_TIME_ZONE.
+    const out = redactSecrets(await runWithConfig(cfg, () => spec.run(valid, makeApi(cfg))));
     return spec.untrusted === false ? textResult(out) : untrustedResult(out);
   } catch (err) {
     const message = scrub((err as Error).message, config);

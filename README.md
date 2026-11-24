@@ -42,6 +42,7 @@ Every endpoint and `client_id` is a setting, so a change on Fortinet's side need
 | `FORTICLOUD_FGT_URL` | Default `https://api.fortigate.forticloud.com/forticloudapi/v1` (Global and Canada). |
 | `FORTICLOUD_ASSET_CLIENT_ID` | Default `assetmanagement`. |
 | `FORTICLOUD_FGT_CLIENT_ID` | Default `fortigatecloud`. |
+| `FORTICLOUD_TIME_ZONE` | IANA time zone that dates are shown in, e.g. `Australia/Melbourne` (the Cititec host). Default `UTC`. See "Dates and days left". |
 | `FORTICLOUD_UNTRUSTED_MARKERS` | `off` disables the `<forticloud-data>` wrapper (below). |
 | `LOG_LEVEL` | `debug`, `info` (default), `warn`, `error`, to stderr. Tool arguments and secrets are never logged. |
 
@@ -65,6 +66,14 @@ All URLs must be https.
 | `forticloud_list_folders` | Asset Management folders (often one per client). |
 
 Lists return `total`, `count`, `offset` and `nextOffset` (Asset Management lists: `totalPages` and `nextPage`), and each response is capped at 60,000 characters. The device list is read once a minute at most and shared by the tools in one session. When FortiGate Cloud does not return the whole device list (paging stops before its advertised total), every result built on it (status, accounts, devices, firmware, config backups, search) carries `complete: false` and a `warning`, so a partial inventory is never presented as the whole fleet.
+
+### Dates and days left
+
+One rule for every tool:
+
+- **`daysLeft`** counts whole 24-hour periods from now to the exact expiry moment, rounded down, and is worked out from FortiCloud's original timestamp. It does not depend on a time zone. `0` means it ends within the next 24 hours (later today included); a negative number means it has ended (`-1` within the last 24 hours).
+- **Dates shown** (`end`, `start`, the `window` of `forticloud_list_expiring`) are calendar dates. A FortiCloud time with an offset (Asset Management writes times like `...-8:00`) or an epoch number is shown as the date it falls on in `FORTICLOUD_TIME_ZONE`. A date with no zone (end-of-support dates, for example) is shown as written.
+- Something with several end dates (a contract's terms) takes the latest **moment**, not the latest text. Contracts, their terms, entitlements and licences all use the same calculation, so they always agree.
 
 ### Untrusted text
 

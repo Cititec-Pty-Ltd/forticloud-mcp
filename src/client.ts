@@ -66,6 +66,22 @@ function clientId(name: string, raw: string | undefined, dflt: string): string {
   return v;
 }
 
+/** An IANA time zone name, checked with Intl; UTC when unset. */
+export function parseTimeZone(raw: string | undefined): string {
+  const tz = raw?.trim() || 'UTC';
+  try {
+    new Intl.DateTimeFormat('en-CA', { timeZone: tz });
+  } catch {
+    throw new ConfigError(`FORTICLOUD_TIME_ZONE "${tz.slice(0, 60)}" is not an IANA time zone (example: Australia/Melbourne).`);
+  }
+  return tz;
+}
+
+/** The time zone dates are shown in for the current tool call (runSpec runs each call inside runWithConfig). */
+export function displayTimeZone(): string {
+  return configStore.getStore()?.timeZone ?? 'UTC';
+}
+
 export function getConfig(env: Record<string, string | undefined> = process.env): ForticloudConfig | null {
   const scoped = configStore.getStore();
   if (scoped?.apiId && scoped.apiPassword) return scoped;
@@ -83,6 +99,7 @@ export function getConfig(env: Record<string, string | undefined> = process.env)
     fgtUrl: parseBaseUrl('FORTICLOUD_FGT_URL', env.FORTICLOUD_FGT_URL?.trim() || DEFAULTS.fgtUrl),
     assetClientId: clientId('FORTICLOUD_ASSET_CLIENT_ID', env.FORTICLOUD_ASSET_CLIENT_ID, DEFAULTS.assetClientId),
     fgtClientId: clientId('FORTICLOUD_FGT_CLIENT_ID', env.FORTICLOUD_FGT_CLIENT_ID, DEFAULTS.fgtClientId),
+    timeZone: parseTimeZone(env.FORTICLOUD_TIME_ZONE),
   };
 }
 

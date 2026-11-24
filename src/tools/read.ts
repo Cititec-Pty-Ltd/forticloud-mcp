@@ -10,8 +10,8 @@ import {
   checkSerialPattern,
   compareFirmware,
   day,
-  daysLeft,
   deviceRow,
+  expiryOf,
   entitlementRow,
   expireBefore,
   has,
@@ -365,12 +365,12 @@ async function getAsset(args: Raw, api: Api) {
       contract: clean(c.contractNumber, 60),
       sku: clean(c.sku ?? c.contractSKU, 80),
       terms: (Array.isArray(c.terms) ? c.terms : []).slice(0, 20).map((t: Raw) =>
-        compact({ supportType: clean(t.supportType, 80), start: day(t.startDate), end: day(t.endDate), daysLeft: daysLeft(t.endDate, now) })
+        compact({ supportType: clean(t.supportType, 80), start: day(t.startDate), ...expiryOf([t.endDate], now) })
       ),
     })
   );
   const licenses = (Array.isArray(d.licenses) ? d.licenses : d.license ? [d.license] : []).slice(0, 50).map((l: Raw) =>
-    compact({ license: clean(l.licenseNumber, 60), sku: clean(l.licenseSKU ?? l.sku, 80), status: clean(l.status, 40), end: day(l.expirationDate ?? l.endDate) })
+    compact({ license: clean(l.licenseNumber, 60), sku: clean(l.licenseSKU ?? l.sku, 80), status: clean(l.status, 40), ...expiryOf([l.expirationDate ?? l.endDate], now) })
   );
   return compact({
     ...assetRow(d, now),
@@ -433,17 +433,16 @@ async function listContracts(args: Raw, api: Api) {
   const now = Date.now();
   const rows = list.map((c) => {
     const terms = (Array.isArray(c.terms) ? c.terms : []) as Raw[];
-    const ends = terms.map((t) => day(t.endDate)).filter(Boolean).sort();
-    const end = ends[ends.length - 1] ?? day(c.endDate ?? c.expirationDate);
+    // The latest end among the terms (or the contract's own end), from the original timestamps.
+    const expiry = expiryOf(terms.length ? terms.map((t) => t.endDate) : [c.endDate ?? c.expirationDate], now);
     return compact({
       contract: clean(c.contractNumber, 60),
       sku: clean(c.sku ?? c.contractSKU, 80),
       status: clean(c.status, 40),
       description: clean(c.description ?? c.productDescription, 200),
-      end,
-      daysLeft: end ? daysLeft(end, now) : undefined,
+      ...expiry,
       units: tidy(c.serialNumbers ?? c.units ?? c.assets, 2, 20),
-      terms: terms.length ? terms.slice(0, 20).map((t) => compact({ supportType: clean(t.supportType, 80), start: day(t.startDate), end: day(t.endDate) })) : undefined,
+      terms: terms.length ? terms.slice(0, 20).map((t) => compact({ supportType: clean(t.supportType, 80), start: day(t.startDate), ...expiryOf([t.endDate], now) })) : undefined,
     });
   });
   rows.sort((a, b) => (a.daysLeft ?? Infinity) - (b.daysLeft ?? Infinity));

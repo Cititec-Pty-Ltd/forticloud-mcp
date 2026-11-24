@@ -1,4 +1,5 @@
 import type { Api } from '../client.js';
+import { displayTimeZone } from '../client.js';
 import { ForticloudRateLimitError } from '../types.js';
 import { InputError, clean, compact, num } from './shared.js';
 
@@ -27,10 +28,23 @@ export function parseDate(value: unknown): number | undefined {
   return Number.isNaN(ms) ? undefined : ms;
 }
 
-/** YYYY-MM-DD (UTC) of a FortiCloud date; undefined when there is none. */
-export function day(value: unknown): string | undefined {
+/**
+ * The calendar date (YYYY-MM-DD) of a FortiCloud date, for display.
+ *
+ * Time-zone rule (the same for every tool):
+ * - a date with an offset ("...-8:00", "...Z") or an epoch number is a moment,
+ *   shown as the date it falls on in FORTICLOUD_TIME_ZONE (default UTC; the
+ *   Cititec host uses Australia/Melbourne);
+ * - a date with no zone ("2030-01-01T00:00:00") is a calendar date and is shown
+ *   as written.
+ * daysLeft never depends on the time zone; see daysLeft.
+ */
+export function day(value: unknown, timeZone: string = displayTimeZone()): string | undefined {
+  if (typeof value === 'string' && /^d{4}-dd-dd(T[d:.]+)?$/.test(value.trim())) return value.trim().slice(0, 10);
   const ms = parseDate(value);
-  return ms === undefined ? undefined : new Date(ms).toISOString().slice(0, 10);
+  if (ms === undefined) return undefined;
+  // en-CA formats as YYYY-MM-DD.
+  return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
 }
 
 /** ISO date-time (UTC, seconds) of a FortiCloud date. */
@@ -39,10 +53,34 @@ export function stamp(value: unknown): string | undefined {
   return ms === undefined ? undefined : new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
 }
 
-/** Whole days from `now` to the date (negative when past). */
+/**
+ * Whole 24-hour periods from `now` to the exact expiry moment, rounded down:
+ * 0 = ends within the next 24 hours (later today included), negative = has
+ * ended (-1 = within the last 24 hours). Computed from the original timestamp,
+ * never from a displayed date, so it does not depend on any time zone.
+ */
 export function daysLeft(value: unknown, now = Date.now()): number | undefined {
   const ms = parseDate(value);
   return ms === undefined ? undefined : Math.floor((ms - now) / DAY_MS);
+}
+
+/**
+ * The expiry of something with one or more end dates (an entitlement, a
+ * contract and its terms, a licence): the latest moment among `values`, with
+ * its display date and daysLeft both taken from that original value. Every
+ * tool uses this, so contracts and entitlements always agree.
+ */
+export function expiryOf(values: unknown[], now = Date.now()): { end?: string; daysLeft?: number } {
+  let best: unknown;
+  let bestMs = -Infinity;
+  for (const v of values) {
+    const ms = parseDate(v);
+    if (ms !== undefined && ms > bestMs) {
+      best = v;
+      bestMs = ms;
+    }
+  }
+  return best === undefined ? {} : { end: day(best), daysLeft: daysLeft(best, now) };
 }
 
 /** The cut-off date Asset Management's expireBefore takes, `days` from now. */
@@ -323,8 +361,7 @@ export function entitlementRow(e: Raw, now = Date.now()): EntitlementRow {
     type: clean(e.typeDesc ?? e.type, 80),
     level: clean(e.levelDesc ?? e.level, 60),
     start: day(e.startDate),
-    end: day(e.endDate ?? e.expirationDate ?? e.experiationDate),
-    daysLeft: daysLeft(e.endDate ?? e.expirationDate ?? e.experiationDate, now),
+    ...expiryOf([e.endDate ?? e.expirationDate ?? e.experiationDate], now),
   }) as EntitlementRow;
 }
 
