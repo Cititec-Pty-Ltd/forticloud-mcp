@@ -213,6 +213,49 @@ describe('FortiGate Cloud devices', () => {
     setFetchForTests(fn2);
     expect(dataOf(await call('forticloud_list_devices')).complete).toBeUndefined();
   });
+  it('every tool built on the device list says when that list is incomplete', async () => {
+    const page = Array.from({ length: 500 }, (_, i) => ({ sn: `FGT60FTK${String(i).padStart(8, '0')}`, tunnelAlive: true, subAccountOid: 100, total: 1200 }));
+    const { fn } = fakeForticloud(
+      fgtRoutes({
+        [`${FGT}/devices`]: json(page),
+        [`${FGT}/devices/FGT60FTK00000000/configbackups/setting`]: json({ enabled: true }),
+        [`${FGT}/devices/FGT60FTK99999999`]: json({ error: 'not found' }, 404),
+        [`${ASSET}/folders/list`]: json({ status: 0, folders: [] }),
+      })
+    );
+    setFetchForTests(fn);
+    const partial = { complete: false, warning: expect.stringMatching(/did not return the whole device list/) };
+    expect(dataOf(await call('forticloud_status')).fortigateCloud).toMatchObject(partial);
+    expect(dataOf(await call('forticloud_list_accounts'))).toMatchObject(partial);
+    expect(dataOf(await call('forticloud_list_devices'))).toMatchObject(partial);
+    expect(dataOf(await call('forticloud_firmware_summary'))).toMatchObject(partial);
+    const backups = dataOf(await call('forticloud_config_backup_status', { limit: 1 }));
+    expect(backups).toMatchObject({ ...partial, total: 500, count: 1 });
+    expect(dataOf(await call('forticloud_search', { query: 'FGT60FTK0000000', include_assets: false }))).toMatchObject(partial);
+    const missing = await call('forticloud_get_device', { serial: 'FGT60FTK99999999', include_asset: false });
+    expect(missing.isError).toBe(true);
+    expect(textOf(missing)).toMatch(/HTTP 404.*not in the device list either, but that list is incomplete/s);
+  });
+  it('a complete device list carries no warning; a failed one is named in list_accounts', async () => {
+    const { fn } = fakeForticloud(fgtRoutes());
+    setFetchForTests(fn);
+    for (const [tool, args] of [
+      ['forticloud_list_devices', {}],
+      ['forticloud_firmware_summary', {}],
+      ['forticloud_list_accounts', {}],
+      ['forticloud_search', { query: 'client', include_assets: false }],
+    ] as const) {
+      const out = dataOf(await call(tool, args));
+      expect(out.complete).toBeUndefined();
+      expect(out.warning).toBeUndefined();
+    }
+    clearCaches();
+    const { fn: broken } = fakeForticloud({ [`${FGT}/subaccounts`]: json(SUBACCOUNTS), [`${FGT}/devices`]: json({}, 500) });
+    setFetchForTests(broken);
+    const out = dataOf(await call('forticloud_list_accounts'));
+    expect(out).toMatchObject({ complete: false, warning: expect.stringMatching(/Device counts are missing.*HTTP 500/) });
+    expect(out.accounts).toHaveLength(3);
+  });
   it('caches the device list per API user, not per endpoint', async () => {
     const { fn, calls } = fakeForticloud(fgtRoutes());
     setFetchForTests(fn);

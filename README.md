@@ -64,7 +64,7 @@ All URLs must be https.
 | `forticloud_list_contracts` | Contracts with SKU, status, terms and end date. |
 | `forticloud_list_folders` | Asset Management folders (often one per client). |
 
-Lists return `total`, `count`, `offset` and `nextOffset` (Asset Management lists: `totalPages` and `nextPage`), and each response is capped at 60,000 characters. The device list is read once a minute at most and shared by the tools in one session.
+Lists return `total`, `count`, `offset` and `nextOffset` (Asset Management lists: `totalPages` and `nextPage`), and each response is capped at 60,000 characters. The device list is read once a minute at most and shared by the tools in one session. When FortiGate Cloud does not return the whole device list (paging stops before its advertised total), every result built on it (status, accounts, devices, firmware, config backups, search) carries `complete: false` and a `warning`, so a partial inventory is never presented as the whole fleet.
 
 ### Untrusted text
 

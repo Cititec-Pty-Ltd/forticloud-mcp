@@ -62,6 +62,16 @@ const partError = (err: unknown) => clean((err as Error).message, 300) ?? 'faile
 
 // --- FortiGate Cloud ---------------------------------------------------------------------------
 
+/** Said whenever a result rests on a device list that FortiGate Cloud did not return in full. */
+export const INCOMPLETE_WARNING =
+  'FortiGate Cloud did not return the whole device list (paging stopped before its advertised total, or after 10 pages), ' +
+  'so this result covers only part of the fleet. Do not present it as complete; narrow the question (an account or a name) or report the gap.';
+
+/** Every tool built on allDevices spreads this into its result, so a partial inventory is never shown as a full one. */
+export function completeness(complete: boolean): { complete?: false; warning?: string } {
+  return complete ? {} : { complete: false, warning: INCOMPLETE_WARNING };
+}
+
 async function devicesWithAccounts(api: Api) {
   const [{ devices, complete }, accounts] = await Promise.all([allDevices(api), accountNames(api)]);
   return { rows: devices.map((d) => deviceRow(d, accounts ?? undefined)), complete, accounts };
@@ -84,7 +94,7 @@ async function status(api: Api) {
     const token = await api.token('fgt');
     const { devices, complete } = await allDevices(api);
     const rows = devices.map((d) => deviceRow(d));
-    return compact({ ok: true, tokenSecondsLeft: token.secondsLeft, devices: rows.length, complete, ...connectionCounts(rows) });
+    return compact({ ok: true, tokenSecondsLeft: token.secondsLeft, devices: rows.length, ...completeness(complete), ...connectionCounts(rows) });
   })().catch((err) => ({ ok: false, error: partError(err) }));
   // Asset Management allows only 10 errors an hour, so its check is the cheapest read there is.
   const asset = (async () => {
@@ -102,7 +112,11 @@ async function status(api: Api) {
 }
 
 async function listAccounts(args: Raw, api: Api) {
-  const [body, { rows }] = await Promise.all([api.fgt('/subaccounts'), devicesWithAccounts(api).catch(() => ({ rows: [] as DeviceRow[] }))]);
+  const [body, inventory] = await Promise.all([
+    api.fgt('/subaccounts'),
+    devicesWithAccounts(api).catch((err) => ({ rows: [] as DeviceRow[], complete: false, error: partError(err) })),
+  ]);
+  const rows = inventory.rows;
   const counts = new Map<number, { devices: number; offline: number }>();
   for (const r of rows) {
     if (r.accountId === undefined) continue;
@@ -116,7 +130,14 @@ async function listAccounts(args: Raw, api: Api) {
     .map((a) => ({ ...a, ...(a.accountId !== undefined ? counts.get(a.accountId) : undefined) }))
     .sort((a, b) => String(a.name ?? '').localeCompare(String(b.name ?? '')));
   const { items, ...paging } = pageOf(accounts, int(args.limit)!, int(args.offset)!);
-  return { ...paging, accounts: items };
+  const deviceError = 'error' in inventory ? inventory.error : undefined;
+  return compact({
+    ...paging,
+    ...(deviceError
+      ? { complete: false, warning: `Device counts are missing: the device list could not be read (${deviceError}).` }
+      : completeness(inventory.complete)),
+    accounts: items,
+  });
 }
 
 async function listDevices(args: Raw, api: Api) {
@@ -138,7 +159,7 @@ async function listDevices(args: Raw, api: Api) {
   return compact({
     ...paging,
     matching: connectionCounts(filtered),
-    complete: complete ? undefined : false,
+    ...completeness(complete),
     note: accounts === null && str(args.account) !== undefined ? 'Sub-account names could not be read; filter by the numeric account ID.' : undefined,
     devices: items,
   });
@@ -167,9 +188,12 @@ async function getDevice(args: Raw, api: Api) {
     raw = (Array.isArray(body) ? body[0] : (body as Raw)?.data ?? body) as Raw;
   } catch (err) {
     // Some accounts answer the list but not the single device; fall back to the list.
-    const { devices } = await allDevices(api);
+    const { devices, complete } = await allDevices(api);
     raw = devices.find((d) => serialOf(d) === sn);
-    if (!raw) throw err;
+    if (!raw) {
+      if (complete) throw err;
+      throw new Error(`${(err as Error).message} It is not in the device list either, but that list is incomplete: ${INCOMPLETE_WARNING}`);
+    }
   }
   const [backup, asset] = await Promise.all([
     api.fgt(`/devices/${sn}/configbackups/setting`).then(
@@ -220,21 +244,24 @@ async function firmwareSummary(args: Raw, api: Api) {
     const m = r.firmware?.match(/\d+\.\d+/)?.[0] ?? 'unknown';
     majors[m] = (majors[m] ?? 0) + 1;
   }
-  return compact({ devices: filtered.length, complete: complete ? undefined : false, byMajorVersion: majors, versions });
+  return compact({ devices: filtered.length, ...completeness(complete), byMajorVersion: majors, versions });
 }
 
 async function configBackupStatus(args: Raw, api: Api) {
   let targets: DeviceRow[];
   let total: number;
   let next: number | undefined;
+  // One serial is read directly, so the list's completeness does not matter there.
+  let complete = true;
   if (str(args.serial) !== undefined) {
     const sn = checkSerial(args.serial);
     const { rows } = await devicesWithAccounts(api).catch(() => ({ rows: [] as DeviceRow[] }));
     targets = [rows.find((r) => r.serial.toUpperCase() === sn) ?? { serial: sn, connection: 'unknown' }];
     total = 1;
   } else {
-    const { rows } = await devicesWithAccounts(api);
-    const all = rows.filter((r) => matchAccount(r, str(args.account))).sort((a, b) => String(a.name ?? a.serial).localeCompare(String(b.name ?? b.serial)));
+    const inventory = await devicesWithAccounts(api);
+    complete = inventory.complete;
+    const all = inventory.rows.filter((r) => matchAccount(r, str(args.account))).sort((a, b) => String(a.name ?? a.serial).localeCompare(String(b.name ?? b.serial)));
     const page = pageOf(all, int(args.limit)!, int(args.offset)!);
     targets = page.items;
     total = page.total;
@@ -260,6 +287,7 @@ async function configBackupStatus(args: Raw, api: Api) {
     total,
     count: results.length,
     nextOffset: next,
+    ...completeness(complete),
     note: 'FortiGate Cloud publishes the automatic backup settings per device; it has no documented list of backup revisions.',
     devices: results,
   });
@@ -426,8 +454,12 @@ async function listFolders(args: Raw, api: Api) {
 async function search(args: Raw, api: Api) {
   const q = str(args.query)!;
   if (q.length < 2) throw new InputError('query must be at least 2 characters');
+  let devicesComplete = true;
   const devices = devicesWithAccounts(api).then(
-    ({ rows }) => rows.filter((r) => has(r.name, q) || has(r.serial, q) || has(r.account, q)).slice(0, 25),
+    ({ rows, complete }) => {
+      devicesComplete = complete;
+      return rows.filter((r) => has(r.name, q) || has(r.serial, q) || has(r.account, q)).slice(0, 25);
+    },
     (err) => ({ error: partError(err) })
   );
   const looksLikeSerial = /^[A-Za-z0-9-]{4,40}$/.test(q) && /\d/.test(q);
@@ -445,6 +477,7 @@ async function search(args: Raw, api: Api) {
   return compact({
     query: q,
     fortigateCloudDevices: d,
+    ...completeness(devicesComplete),
     assetManagement: a,
     note: looksLikeSerial || !args.include_assets ? undefined : 'Asset Management is searched only by serial number (prefix); this query is not one.',
   });
