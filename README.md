@@ -90,6 +90,8 @@ The proxy helper (`fortiosRequest` in `src/client.ts`) is GET only and takes an 
 
 Defaults are every section but `addresses`, with up to `max_rows` (50) rows each. Each section names its source (live or configured), and the result has the device's name, account, FortiOS version and the time it was read (in `FORTICLOUD_TIME_ZONE`). If the first section's reads fail outright (not a 404), the other sections are not tried, because FortiGate Cloud allows few errors a minute.
 
+When a FortiOS answer is longer than this server reads (each endpoint has a row cap, and lists inside a row are cut at 200), the section says `truncated: true` and lists the reads in `truncatedReads` (`kept` and `returned` rows, or nested lists cut), so a partial answer never reads as complete. When `max_rows` (or the 500-interface or 50-phase-2 listing caps) leaves rows out, the section gives `shown` and a `moreRows` note next to the real `total`.
+
 `forticloud_find_ip` reads the configured and live interface addresses of every FortiGate that is **online** in FortiGate Cloud (or of one `account`), and matches interfaces whose subnet contains the address, or overlaps the subnet given; exact interface addresses come first. Its bounds:
 
 - 4 devices at a time (2 reads each, under the client's cap of 6 reads in flight), each read timing out after 20 s;

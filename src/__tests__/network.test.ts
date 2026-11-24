@@ -1,7 +1,7 @@
 import { gzipSync } from 'node:zlib';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { decodeBody, setFetchForTests } from '../client.js';
-import { FORTIOS_ENDPOINTS, SECRET_NAME, filterFortios } from '../fortios.js';
+import { FORTIOS_ENDPOINTS, MAX_NESTED, SECRET_NAME, filterFortios } from '../fortios.js';
 import type { Shape } from '../fortios.js';
 import { clearCaches, timeIn } from '../tools/format.js';
 import { dispatchToolCall } from '../tools/index.js';
@@ -379,6 +379,102 @@ describe('forticloud_get_network', () => {
   });
 });
 
+describe('forticloud_get_network: cut answers and rows left out are always said', () => {
+  const ALL = ['interfaces', 'dhcp', 'routes', 'vips', 'vpn', 'addresses'];
+
+  it('interfaces: a capped answer is truncated with kept and returned; rows past the listing cap are counted, not dropped silently', async () => {
+    const cap = FORTIOS_ENDPOINTS.interfaceConfig.maxItems;
+    const cfg = Array.from({ length: cap + 1 }, (_, i) => ({ name: `vl${String(i).padStart(4, '0')}`, type: 'vlan', ip: `10.${i >> 8}.${i & 255}.1 255.255.255.255` }));
+    // Live-only interfaces on top of the 500 configured ones kept: 510 with an address to list.
+    const live = Object.fromEntries(Array.from({ length: 10 }, (_, i) => [`live${i}`, { name: `live${i}`, ip: `172.16.${i}.1`, mask: 24, link: true }]));
+    const { fn } = fakeForticloud(networkRoutes(SN, { [FOS(SN, 'cmdb/system/interface')]: json(envelope(cfg)), [FOS(SN, 'monitor/system/interface')]: json(envelope(live)) }));
+    setFetchForTests(fn);
+    const s = dataOf(await call('forticloud_get_network', { serial: SN, sections: ['interfaces'] })).interfaces;
+    expect(s.truncated).toBe(true);
+    expect(s.truncatedReads).toEqual([{ read: 'cmdb system/interface', kept: cap, returned: cap + 1 }]);
+    expect(s.truncatedNote).toMatch(/cover only the rows read/);
+    expect(s.total).toBe(cap + 10);
+    expect(s.shown).toBe(500);
+    expect(s.moreRows).toBe('10 more not shown; at most 500 interfaces are listed');
+    expect(s.interfaces).toHaveLength(500);
+  });
+
+  it('a complete answer has no truncated flag in any section', async () => {
+    const { fn } = fakeForticloud(networkRoutes());
+    setFetchForTests(fn);
+    const out = dataOf(await call('forticloud_get_network', { serial: SN, sections: ALL }));
+    for (const s of ALL) {
+      expect(out[s].truncated).toBeUndefined();
+      expect(out[s].moreRows).toBeUndefined();
+    }
+  });
+
+  const capped: [string, string, keyof typeof FORTIOS_ENDPOINTS, (i: number) => Record<string, unknown>][] = [
+    ['dhcp', 'cmdb system.dhcp/server', 'dhcpServers', (i) => ({ id: i, interface: `if${i}` })],
+    ['dhcp', 'monitor system/dhcp (lease counts)', 'dhcpLeases', () => ({ interface: 'internal' })],
+    ['routes', 'monitor router/ipv4', 'routesLive', (i) => ({ ip_mask: `10.${i >> 8}.${i & 255}.0/24`, type: 'static' })],
+    ['vips', 'cmdb firewall/vip', 'vips', (i) => ({ name: `vip${i}` })],
+    ['vpn', 'monitor vpn/ipsec', 'ipsecLive', (i) => ({ name: `t${i}` })],
+    ['vpn', 'cmdb vpn.ipsec/phase1-interface', 'ipsecPhase1', (i) => ({ name: `t${i}` })],
+    ['vpn', 'cmdb vpn.ipsec/phase2-interface', 'ipsecPhase2', (i) => ({ name: `p${i}`, phase1name: 'to-branch' })],
+    ['addresses', 'cmdb firewall/address', 'addresses', (i) => ({ name: `a${i}`, type: 'ipmask', subnet: '10.0.0.0 255.0.0.0' })],
+  ];
+  for (const [section, read, endpoint, row] of capped) {
+    it(`${section}: a capped ${read} answer is marked truncated`, async () => {
+      const max = FORTIOS_ENDPOINTS[endpoint].maxItems;
+      const path = FORTIOS_ENDPOINTS[endpoint].path;
+      const { fn } = fakeForticloud(networkRoutes(SN, { [FOS(SN, path)]: json(envelope(Array.from({ length: max + 1 }, (_, i) => row(i)))) }));
+      setFetchForTests(fn);
+      const s = dataOf(await call('forticloud_get_network', { serial: SN, sections: [section] }))[section];
+      expect(s.truncated).toBe(true);
+      expect(s.truncatedReads).toEqual([{ read, kept: max, returned: max + 1 }]);
+    });
+  }
+
+  it('a nested list over the cap (DHCP ranges) is marked truncated too', async () => {
+    const ranges = Array.from({ length: MAX_NESTED + 1 }, (_, i) => ({ id: i, 'start-ip': '192.168.10.10', 'end-ip': '192.168.10.20' }));
+    const { fn } = fakeForticloud(networkRoutes(SN, { [FOS(SN, 'cmdb/system.dhcp/server')]: json(envelope([{ id: 1, interface: 'internal', 'ip-range': ranges }])) }));
+    setFetchForTests(fn);
+    const s = dataOf(await call('forticloud_get_network', { serial: SN, sections: ['dhcp'] })).dhcp;
+    expect(s.truncated).toBe(true);
+    expect(s.truncatedReads).toEqual([{ read: 'cmdb system.dhcp/server', nestedListsCut: `lists inside a row cut at ${MAX_NESTED} entries` }]);
+    expect(s.servers[0].ranges).toHaveLength(MAX_NESTED);
+  });
+
+  it('max_rows: every list section says how many rows it left out, with the real total', async () => {
+    const two = (rows: unknown[]) => json(envelope(rows));
+    const { fn } = fakeForticloud(
+      networkRoutes(SN, {
+        [FOS(SN, 'cmdb/system.dhcp/server')]: two([{ id: 1, interface: 'a' }, { id: 2, interface: 'b' }]),
+        [FOS(SN, 'cmdb/firewall/vip')]: two([{ name: 'v1' }, { name: 'v2' }]),
+        [FOS(SN, 'monitor/vpn/ipsec')]: two([{ name: 't1' }, { name: 't2' }]),
+        [FOS(SN, 'cmdb/firewall/address')]: two([{ name: 'a', type: 'ipmask', subnet: '10.0.0.0 255.0.0.0' }, { name: 'b', type: 'ipmask', subnet: '10.1.0.0 255.255.0.0' }]),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call('forticloud_get_network', { serial: SN, sections: ALL, max_rows: 1 }));
+    const lists: Record<string, string> = { dhcp: 'servers', routes: 'routes', vips: 'vips', vpn: 'tunnels', addresses: 'addresses' };
+    for (const [s, key] of Object.entries(lists)) {
+      expect(out[s][key]).toHaveLength(1);
+      expect(out[s].shown).toBe(1);
+      expect(out[s].moreRows).toMatch(/^\d+ more not shown; raise max_rows/);
+    }
+    expect(out.dhcp.total).toBe(2);
+    expect(out.vpn.total).toBe(4); // two phase 1 tunnels plus two live-only ones
+    expect(out.routes.moreRows).toBe('1 more not shown; raise max_rows to see them');
+  });
+
+  it('vpn: more phase 2 selectors than listed per tunnel are counted', async () => {
+    const proxyid = Array.from({ length: 60 }, (_, i) => ({ p2name: `p${i}`, status: 'up', proxysrc: [{ subnet: '10.0.0.0/255.0.0.0' }], proxydst: [{ subnet: `10.${i}.0.0/255.255.0.0` }] }));
+    const { fn } = fakeForticloud(networkRoutes(SN, { [FOS(SN, 'monitor/vpn/ipsec')]: json(envelope([{ name: 'to-branch', rgwy: '192.0.2.50', proxyid }])) }));
+    setFetchForTests(fn);
+    const t = dataOf(await call('forticloud_get_network', { serial: SN, sections: ['vpn'] })).vpn.tunnels.find((x: any) => x.name === 'to-branch');
+    expect(t.phase2).toHaveLength(50);
+    expect(t.phase2Total).toBe(60);
+    expect(t.phase2Note).toBe('10 more phase 2 selectors not shown (at most 50 per tunnel)');
+  });
+});
+
 describe('forticloud_find_ip', () => {
   const C_CONFIG = [{ name: 'lan', type: 'physical', role: 'lan', ip: '192.168.10.1 255.255.255.0' }, { name: 'wan1', role: 'wan', mode: 'dhcp', ip: '0.0.0.0 0.0.0.0' }];
   const C_LIVE = { lan: { name: 'lan', ip: '192.168.10.1', mask: 24, link: true }, wan1: { name: 'wan1', ip: '198.51.100.40', mask: 29, link: true } };
@@ -543,6 +639,16 @@ describe('forticloud_find_ip', () => {
     const before = fortiosCalls(calls).length;
     await call('forticloud_find_ip', { query: '192.168.10.5', account: 'client c' });
     expect(fortiosCalls(calls).length).toBe(before + 2);
+  });
+
+  it('secondary IPs cut at the nested-list cap also leave the device partly searched (truncated)', async () => {
+    const secondaryip = Array.from({ length: MAX_NESTED + 1 }, (_, i) => ({ id: i, ip: `10.77.${i}.1 255.255.255.0` }));
+    const { fn } = fakeForticloud(fleet({ [FOS(SN3, 'cmdb/system/interface')]: json(envelope([{ ...C_CONFIG[0], secondaryip }, C_CONFIG[1]])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call('forticloud_find_ip', { query: '10.77.5.9', account: 'client c' }));
+    expect(out.results).toEqual([expect.objectContaining({ interface: 'lan', interfaceAddress: '10.77.5.1/24', source: 'configured secondary' })]);
+    expect(out.partlySearchedDevices).toEqual([expect.objectContaining({ incomplete: [{ read: 'configured addresses (cmdb system/interface)', reason: 'truncated' }] })]);
+    expect(out.complete).toBe(false);
   });
 
   it('a 429 stops the search with a structured rate_limited error', async () => {

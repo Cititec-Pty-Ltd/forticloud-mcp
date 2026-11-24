@@ -1,4 +1,5 @@
 import type { Api } from '../client.js';
+import { MAX_NESTED } from '../fortios.js';
 import type { FortiosEndpointName, FortiosResult } from '../fortios.js';
 import { ForticloudApiError, ForticloudRateLimitError } from '../types.js';
 import { checkSerial, timeIn } from './format.js';
@@ -71,8 +72,45 @@ async function both(ctx: Ctx, a: FortiosEndpointName, b: FortiosEndpointName) {
   };
 }
 
+/**
+ * Says when a section rests on a FortiOS answer this server cut: more rows
+ * than the endpoint's cap (`kept` of `returned`), or a nested list (secondary
+ * IPs, DHCP ranges, phase 2 selectors) over MAX_NESTED. Every section spreads
+ * this in, so a cut answer never reads as complete; its totals and counts then
+ * cover only what was read.
+ */
+function cutInfo(reads: [label: string, res: FortiosResult | undefined][]) {
+  const cut = reads
+    .filter(([, r]) => r && (r.truncated || r.nestedCut))
+    .map(([read, r]) =>
+      compact({
+        read,
+        kept: r!.truncated ? r!.rows.length : undefined,
+        returned: r!.returned,
+        nestedListsCut: r!.nestedCut ? `lists inside a row cut at ${MAX_NESTED} entries` : undefined,
+      })
+    );
+  return cut.length
+    ? {
+        truncated: true as const,
+        truncatedReads: cut,
+        truncatedNote: 'The device returned more than this server reads; totals and counts below cover only the rows read.',
+      }
+    : {};
+}
+
+/** Says when rows were left out of a section's list by max_rows (or a fixed cap), with the real total. */
+function shownInfo(total: number, shown: number, hint: string) {
+  return shown < total ? { shown, moreRows: `${total - shown} more not shown; ${hint}` } : {};
+}
+
+const MORE = 'raise max_rows to see them';
+
 /** Public: a usable address that is not private (see isPrivate). */
 const isPublicNet = (n: Net | undefined) => (n ? !isPrivate(n.ip) : false);
+
+/** Most interfaces one get_network lists. */
+const MAX_INTERFACES_SHOWN = 500;
 
 async function interfaces(ctx: Ctx) {
   const r = await both(ctx, 'interfaceConfig', 'interfaceLive');
@@ -125,6 +163,7 @@ async function interfaces(ctx: Ctx) {
   for (const [name, l] of live) if (!names.has(name)) build(undefined, l);
   rows.sort((x, y) => x._sort - y._sort || String(x.name).localeCompare(String(y.name)));
   const shown = ctx.allInterfaces ? rows : rows.filter((x) => x._sort < 2);
+  const listed = shown.slice(0, MAX_INTERFACES_SHOWN);
   return compact({
     source: compact({
       configured: r.a ? 'cmdb system/interface' : undefined,
@@ -132,10 +171,15 @@ async function interfaces(ctx: Ctx) {
     }),
     configuredError: r.aError,
     liveError: r.bError,
+    ...cutInfo([
+      ['cmdb system/interface', r.a],
+      ['monitor system/interface', r.b],
+    ]),
     total: rows.length,
     hiddenWithoutAddress: rows.length - shown.length || undefined,
     note: rows.length > shown.length ? 'Interfaces with no address are left out; set all_interfaces to see them.' : undefined,
-    interfaces: shown.slice(0, 500).map(({ _sort, ...rest }) => rest),
+    ...shownInfo(shown.length, listed.length, `at most ${MAX_INTERFACES_SHOWN} interfaces are listed`),
+    interfaces: listed.map(({ _sort, ...rest }) => rest),
   });
 }
 
@@ -175,8 +219,13 @@ async function dhcp(ctx: Ctx) {
   return compact({
     source: compact({ configured: 'cmdb system.dhcp/server', leases: leases.status === 'fulfilled' ? 'monitor system/dhcp (count only)' : undefined }),
     leasesError: leases.status === 'rejected' ? partError(leases.reason) : undefined,
-    servers: rows.slice(0, ctx.maxRows),
+    ...cutInfo([
+      ['cmdb system.dhcp/server', servers.value],
+      ['monitor system/dhcp (lease counts)', leases.status === 'fulfilled' ? leases.value : undefined],
+    ]),
     total: rows.length,
+    ...shownInfo(rows.length, Math.min(rows.length, ctx.maxRows), MORE),
+    servers: rows.slice(0, ctx.maxRows),
   });
 }
 
@@ -227,13 +276,13 @@ async function routes(ctx: Ctx) {
   return compact({
     source,
     liveError,
+    ...cutInfo([[live ? 'monitor router/ipv4' : 'cmdb router/static', res]]),
     total: rows.length,
-    truncated: res.truncated,
     byType,
     defaultRoutes: defaults.length ? defaults : undefined,
     note: defaults.length ? undefined : 'No default route (0.0.0.0/0) in this table.',
+    ...shownInfo(rows.length, Math.min(rows.length, ctx.maxRows), MORE),
     routes: ordered.slice(0, ctx.maxRows),
-    nextRows: rows.length > ctx.maxRows ? `${rows.length - ctx.maxRows} more; raise max_rows to see them` : undefined,
   });
 }
 
@@ -256,8 +305,17 @@ async function vips(ctx: Ctx) {
       comment: text(v.comment, 200),
     });
   });
-  return compact({ source: 'configured (cmdb firewall/vip)', total: rows.length, vips: rows.slice(0, ctx.maxRows) });
+  return compact({
+    source: 'configured (cmdb firewall/vip)',
+    ...cutInfo([['cmdb firewall/vip', res]]),
+    total: rows.length,
+    ...shownInfo(rows.length, Math.min(rows.length, ctx.maxRows), MORE),
+    vips: rows.slice(0, ctx.maxRows),
+  });
 }
+
+/** Most phase 2 selectors listed per tunnel. */
+const MAX_PHASE2_SHOWN = 50;
 
 async function vpn(ctx: Ctx) {
   const [liveR, p1R, p2R] = await Promise.allSettled([read(ctx, 'ipsecLive'), read(ctx, 'ipsecPhase1'), read(ctx, 'ipsecPhase2')]);
@@ -292,7 +350,9 @@ async function vpn(ctx: Ctx) {
       remoteGateway: addr(l?.rgwy) ?? addr(p1?.['remote-gw']) ?? text(p1?.['remotegw-ddns'], 120),
       ikeVersion: text(p1?.['ike-version'], 4),
       status: l ? (up ? 'up' : 'down') : liveR.status === 'fulfilled' ? 'down' : undefined,
-      phase2: phase2.length ? phase2.slice(0, 50) : undefined,
+      phase2: phase2.length ? phase2.slice(0, MAX_PHASE2_SHOWN) : undefined,
+      phase2Total: phase2.length > MAX_PHASE2_SHOWN ? phase2.length : undefined,
+      phase2Note: phase2.length > MAX_PHASE2_SHOWN ? `${phase2.length - MAX_PHASE2_SHOWN} more phase 2 selectors not shown (at most ${MAX_PHASE2_SHOWN} per tunnel)` : undefined,
       comments: text(p1?.comments ?? l?.comments, 200),
     });
   };
@@ -312,8 +372,14 @@ async function vpn(ctx: Ctx) {
     }),
     liveError: liveR.status === 'rejected' ? partError(liveR.reason) : undefined,
     configuredError: p1R.status === 'rejected' ? partError(p1R.reason) : p2R.status === 'rejected' ? partError(p2R.reason) : undefined,
+    ...cutInfo([
+      ['monitor vpn/ipsec', liveR.status === 'fulfilled' ? liveR.value : undefined],
+      ['cmdb vpn.ipsec/phase1-interface', p1R.status === 'fulfilled' ? p1R.value : undefined],
+      ['cmdb vpn.ipsec/phase2-interface', p2R.status === 'fulfilled' ? p2R.value : undefined],
+    ]),
     total: rows.length,
     up: liveR.status === 'fulfilled' ? rows.filter((r) => r.status === 'up').length : undefined,
+    ...shownInfo(rows.length, Math.min(rows.length, ctx.maxRows), MORE),
     tunnels: rows.slice(0, ctx.maxRows),
   });
 }
@@ -331,11 +397,13 @@ async function addresses(ctx: Ctx) {
   }
   return compact({
     source: 'configured (cmdb firewall/address)',
+    ...cutInfo([['cmdb firewall/address', res]]),
     total: res.rows.length,
     byType,
     note: 'Only subnet (ipmask) and range objects are listed; the other types are counted in byType.',
+    listed: rows.length,
+    ...shownInfo(rows.length, Math.min(rows.length, ctx.maxRows), MORE),
     addresses: rows.slice(0, ctx.maxRows),
-    nextRows: rows.length > ctx.maxRows ? `${rows.length - ctx.maxRows} more; raise max_rows to see them` : undefined,
   });
 }
 
@@ -452,7 +520,7 @@ async function deviceNets(api: Api, sn: string): Promise<DeviceNets> {
     [live, LIVE_READ],
   ] as const) {
     if (r.status === 'rejected') incomplete.push({ read, reason: 'failed', error: partError(r.reason) });
-    else if (r.value.truncated) incomplete.push({ read, reason: 'truncated' });
+    else if (r.value.truncated || r.value.nestedCut) incomplete.push({ read, reason: 'truncated' });
   }
   const meta = new Map<string, Omit<IfaceNet, 'net' | 'source'>>();
   const nets: IfaceNet[] = [];

@@ -255,8 +255,15 @@ function scalar(v: unknown): string | number | boolean | undefined {
   return undefined;
 }
 
-/** A copy of `value` with only the allowlisted fields (see Shape). */
-export function pick(value: unknown, shape: Shape, depth = 0): Raw | undefined {
+/** Most entries kept from a nested list (secondary IPs, DHCP ranges, phase 2 selectors...). */
+export const MAX_NESTED = 200;
+
+/**
+ * A copy of `value` with only the allowlisted fields (see Shape). A nested
+ * list longer than MAX_NESTED is cut, and `state.cut` is set so the caller
+ * can say so.
+ */
+export function pick(value: unknown, shape: Shape, depth = 0, state?: { cut: boolean }): Raw | undefined {
   if (!value || typeof value !== 'object' || Array.isArray(value) || depth > 4) return undefined;
   const src = value as Raw;
   const out: Raw = {};
@@ -267,12 +274,13 @@ export function pick(value: unknown, shape: Shape, depth = 0): Raw | undefined {
       const s = scalar(v);
       if (s !== undefined) out[field] = s;
     } else if (Array.isArray(v)) {
+      if (v.length > MAX_NESTED && state) state.cut = true;
       out[field] = v
-        .slice(0, 200)
-        .map((x) => pick(x, rule, depth + 1))
+        .slice(0, MAX_NESTED)
+        .map((x) => pick(x, rule, depth + 1, state))
         .filter((x): x is Raw => x !== undefined);
     } else {
-      const o = pick(v, rule, depth + 1);
+      const o = pick(v, rule, depth + 1, state);
       if (o !== undefined) out[field] = o;
     }
   }
@@ -284,6 +292,10 @@ export interface FortiosResult {
   rows: Raw[];
   /** More rows than the endpoint's maxItems were returned; the rest were dropped. */
   truncated?: boolean;
+  /** With truncated: how many rows the device returned. */
+  returned?: number;
+  /** A nested list in some row was longer than MAX_NESTED and was cut. */
+  nestedCut?: boolean;
   version?: string;
   build?: number;
   vdom?: string;
@@ -306,16 +318,18 @@ export function filterFortios(body: unknown, endpoint: FortiosEndpoint): Fortios
       .filter(([, v]) => !!v && typeof v === 'object' && !Array.isArray(v))
       .map(([k, v]) => ((v as Raw).name === undefined ? { ...(v as Raw), name: k } : (v as Raw)));
   }
+  const state = { cut: false };
   const rows = items
     .slice(0, endpoint.maxItems)
-    .map((x) => pick(x, endpoint.fields))
+    .map((x) => pick(x, endpoint.fields, 0, state))
     .filter((x): x is Raw => x !== undefined);
   const version = typeof env.version === 'string' ? env.version.slice(0, 40) : undefined;
   const build = typeof env.build === 'number' ? env.build : undefined;
   const vdom = typeof env.vdom === 'string' ? env.vdom.slice(0, 40) : undefined;
   return {
     rows,
-    ...(items.length > endpoint.maxItems ? { truncated: true } : {}),
+    ...(items.length > endpoint.maxItems ? { truncated: true, returned: items.length } : {}),
+    ...(state.cut ? { nestedCut: true } : {}),
     ...(version ? { version } : {}),
     ...(build !== undefined ? { build } : {}),
     ...(vdom ? { vdom } : {}),
