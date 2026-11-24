@@ -216,14 +216,17 @@ export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolea
   const value = (async () => {
     const seen = new Map<string, Raw>();
     let complete = false;
+    // The largest total any page advertised: a later empty or short page carries none, and must not erase it.
+    let total: number | undefined;
     for (let page = 0; page < MAX_DEVICE_PAGES; page++) {
       const items = listOf(await api.fgt('/devices', { limit: DEVICE_PAGE, offset: page * DEVICE_PAGE }));
       const before = seen.size;
       for (const d of items) {
         const sn = String(d.sn ?? d.serialNumber ?? '');
         if (sn && !seen.has(sn)) seen.set(sn, d);
+        const t = num(d.total);
+        if (t !== undefined) total = Math.max(total ?? 0, t);
       }
-      const total = num(items[0]?.total);
       if (total !== undefined && seen.size >= total) {
         complete = true;
         break;
@@ -234,7 +237,6 @@ export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolea
         break;
       }
       if (seen.size === before) break; // offset ignored: a repeated full page proves nothing about the rest
-
     }
     return { devices: [...seen.values()], complete };
   })();

@@ -4,6 +4,7 @@ import { ALL_TOOLS, READ_TOOL_NAMES, dispatchToolCall } from '../tools/index.js'
 import { clearCaches, compareFirmware, daysLeft, expireBefore, latestByType, parseDate } from '../tools/format.js';
 import { wrapUntrusted } from '../tools/shared.js';
 import { ASSET, FGT, dataOf, fakeForticloud, json, textOf } from './test-helpers.js';
+import type { Call } from './test-helpers.js';
 
 const PASSWORD = 'Sup3r-Secret-Passw0rd!';
 const DAY = 86_400_000;
@@ -187,6 +188,20 @@ describe('FortiGate Cloud devices', () => {
     expect(first.complete).toBe(false);
     await call('forticloud_firmware_summary');
     expect(n).toBe(2);
+  });
+  it('keeps the total page 1 advertised when page 2 is empty or short', async () => {
+    const page1 = Array.from({ length: 500 }, (_, i) => ({ sn: `FGT60FTK${String(i).padStart(8, '0')}`, tunnelAlive: true, total: 1200 }));
+    const page2 = Array.from({ length: 3 }, (_, i) => ({ sn: `FGT40FTK${String(i).padStart(8, '0')}`, tunnelAlive: true }));
+    for (const second of [[], page2]) {
+      clearCaches();
+      const { fn, calls } = fakeForticloud(
+        fgtRoutes({ [`${FGT}/devices`]: (c: Call) => json(c.url.searchParams.get('offset') === '0' ? page1 : second) })
+      );
+      setFetchForTests(fn);
+      const out = dataOf(await call('forticloud_status')).fortigateCloud;
+      expect(out).toMatchObject({ devices: 500 + second.length, complete: false });
+      expect(calls.filter((c) => c.url.pathname.endsWith('/devices')).map((c) => c.url.searchParams.get('offset'))).toEqual(['0', '500']);
+    }
   });
   it('a repeated full page with a larger total is reported incomplete; a short last page is complete', async () => {
     const page = Array.from({ length: 500 }, (_, i) => ({ sn: `FGT60FTK${String(i).padStart(8, '0')}`, tunnelAlive: true, total: 1200 }));
