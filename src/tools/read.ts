@@ -15,7 +15,9 @@ import {
   entitlementRow,
   expireBefore,
   has,
-  latestByType,
+  latestEntitlements,
+  latestMoment,
+  byMoment,
   listOf,
   pageOf,
   serialOf,
@@ -390,20 +392,21 @@ async function listExpiring(args: Raw, api: Api) {
   const body: Raw = { expireBefore: expireBefore(days, now) };
   if (str(args.serial_prefix) !== undefined) body.serialNumber = checkSerialPattern(args.serial_prefix);
   const r = await assetPages(api, body, 1, MAX_ASSET_PAGES);
-  const rows = [];
+  const found: { row: Raw & { type?: string }; ms?: number }[] = [];
   const assetsWithExpiry = new Set<string>();
   for (const a of r.assets) {
     if (a.isDecommissioned === true && !args.include_decommissioned) continue;
     const asset = assetRow(a, now);
     if (!has(asset.folder, str(args.folder))) continue;
-    for (const e of latestByType(a.entitlements, now)) {
+    for (const { row: e, ms } of latestEntitlements(a.entitlements, now)) {
+      // The window is in whole days on purpose (days / include_expired_days); ordering uses the exact moment.
       if (e.daysLeft === undefined || e.daysLeft > days || e.daysLeft < -expiredDays) continue;
       if (!has(e.type, str(args.type))) continue;
-      assetsWithExpiry.add(asset.serial ?? "?");
-      rows.push(compact({ serial: asset.serial, model: asset.model, description: asset.description, folder: asset.folder, ...e }));
+      assetsWithExpiry.add(asset.serial ?? '?');
+      found.push({ row: compact({ serial: asset.serial, model: asset.model, description: asset.description, folder: asset.folder, ...e }), ms });
     }
   }
-  rows.sort((a, b) => (a.daysLeft ?? 0) - (b.daysLeft ?? 0));
+  const rows = found.sort(byMoment).map((x) => x.row);
   const byType: Record<string, number> = {};
   for (const row of rows) byType[row.type ?? '?'] = (byType[row.type ?? '?'] ?? 0) + 1;
   const { items, ...paging } = pageOf(rows, int(args.limit)!, int(args.offset)!);
@@ -434,8 +437,10 @@ async function listContracts(args: Raw, api: Api) {
   const rows = list.map((c) => {
     const terms = (Array.isArray(c.terms) ? c.terms : []) as Raw[];
     // The latest end among the terms (or the contract's own end), from the original timestamps.
-    const expiry = expiryOf(terms.length ? terms.map((t) => t.endDate) : [c.endDate ?? c.expirationDate], now);
-    return compact({
+    const ends = terms.length ? terms.map((t) => t.endDate) : [c.endDate ?? c.expirationDate];
+    const expiry = expiryOf(ends, now);
+    const ms = latestMoment(ends)?.ms;
+    return { ms, row: compact({
       contract: clean(c.contractNumber, 60),
       sku: clean(c.sku ?? c.contractSKU, 80),
       status: clean(c.status, 40),
@@ -443,10 +448,11 @@ async function listContracts(args: Raw, api: Api) {
       ...expiry,
       units: tidy(c.serialNumbers ?? c.units ?? c.assets, 2, 20),
       terms: terms.length ? terms.slice(0, 20).map((t) => compact({ supportType: clean(t.supportType, 80), start: day(t.startDate), ...expiryOf([t.endDate], now) })) : undefined,
-    });
+    }) };
   });
-  rows.sort((a, b) => (a.daysLeft ?? Infinity) - (b.daysLeft ?? Infinity));
-  const { items, ...paging } = pageOf(rows, int(args.limit)!, int(args.offset)!);
+  // Soonest end first, by exact moment (not the rounded daysLeft).
+  const sorted = rows.sort(byMoment).map((x) => x.row);
+  const { items, ...paging } = pageOf(sorted, int(args.limit)!, int(args.offset)!);
   return { ...paging, contracts: items };
 }
 

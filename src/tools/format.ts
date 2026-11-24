@@ -77,17 +77,26 @@ export function daysLeft(value: unknown, now = Date.now()): number | undefined {
  * tool uses this, so contracts and entitlements always agree.
  */
 export function expiryOf(values: unknown[], now = Date.now()): { end?: string; daysLeft?: number } {
-  let best: unknown;
-  let bestMs = -Infinity;
-  for (const v of values) {
-    const ms = parseDate(v);
-    if (ms !== undefined && ms > bestMs) {
-      best = v;
-      bestMs = ms;
-    }
-  }
-  return best === undefined ? {} : { end: day(best), daysLeft: daysLeft(best, now) };
+  const best = latestMoment(values);
+  return best ? { end: day(best.value), daysLeft: daysLeft(best.value, now) } : {};
 }
+
+/**
+ * The latest of `values` by exact parsed moment (never by a rounded day or by
+ * date text), with that original value; undefined when none parses. Ties keep
+ * the first, which only happens for identical moments, so order never matters.
+ */
+export function latestMoment(values: unknown[]): { value: unknown; ms: number } | undefined {
+  let best: { value: unknown; ms: number } | undefined;
+  for (const value of values) {
+    const ms = parseDate(value);
+    if (ms !== undefined && (!best || ms > best.ms)) best = { value, ms };
+  }
+  return best;
+}
+
+/** Sorts by exact moment, soonest first; items with no moment last. */
+export const byMoment = (a: { ms?: number }, b: { ms?: number }): number => (a.ms ?? Infinity) - (b.ms ?? Infinity);
 
 /** The cut-off date Asset Management's expireBefore takes, `days` from now. */
 export function expireBefore(days: number, now = Date.now()): string {
@@ -362,36 +371,57 @@ export interface EntitlementRow {
   daysLeft?: number;
 }
 
+const endOf = (e: Raw): unknown => e.endDate ?? e.expirationDate ?? e.experiationDate;
+
 export function entitlementRow(e: Raw, now = Date.now()): EntitlementRow {
   return compact({
     type: clean(e.typeDesc ?? e.type, 80),
     level: clean(e.levelDesc ?? e.level, 60),
     start: day(e.startDate),
-    ...expiryOf([e.endDate ?? e.expirationDate ?? e.experiationDate], now),
+    ...expiryOf([endOf(e)], now),
   }) as EntitlementRow;
 }
 
 /**
- * The latest entitlement of each type. A renewed service keeps its old,
- * ended entitlement next to the new one; only the latest end date counts.
+ * The latest entitlement of each type, each with its exact end moment (`ms`),
+ * soonest first. A renewed service keeps its old, ended entitlement next to the
+ * new one; only the latest counts. "Latest" is by exact moment, so two ends in
+ * the same 24 hours are told apart and the API's order does not matter; the
+ * display date and daysLeft then come from that one entitlement.
  */
-export function latestByType(entitlements: unknown, now = Date.now()): EntitlementRow[] {
-  const best = new Map<string, EntitlementRow>();
+export function latestEntitlements(entitlements: unknown, now = Date.now()): { row: EntitlementRow; ms?: number }[] {
+  const best = new Map<string, { row: EntitlementRow; ms?: number }>();
   for (const e of Array.isArray(entitlements) ? entitlements : []) {
     if (!e || typeof e !== 'object') continue;
     const row = entitlementRow(e as Raw, now);
+    const ms = parseDate(endOf(e as Raw));
     const key = row.type ?? '?';
     const cur = best.get(key);
-    if (!cur || (row.daysLeft ?? -Infinity) > (cur.daysLeft ?? -Infinity)) best.set(key, row);
+    if (!cur || (ms ?? -Infinity) > (cur.ms ?? -Infinity)) best.set(key, { row, ms });
   }
-  return [...best.values()].sort((a, b) => (a.daysLeft ?? Infinity) - (b.daysLeft ?? Infinity));
+  return [...best.values()].sort(byMoment);
 }
 
-/** One asset (registered product) from products/list or products/details, trimmed. */
+/** latestEntitlements without the moments, for output. */
+export function latestByType(entitlements: unknown, now = Date.now()): EntitlementRow[] {
+  return latestEntitlements(entitlements, now).map((x) => x.row);
+}
+
+/**
+ * One asset (registered product) from products/list or products/details, trimmed.
+ * nextExpiry: the soonest end still ahead (by exact moment). supportEnd: the
+ * latest end among the support-type entitlements (Support, FortiCare), by
+ * exact moment.
+ */
 export function assetRow(a: Raw, now = Date.now()) {
-  const ents = latestByType(a.entitlements, now);
-  const future = ents.filter((e) => (e.daysLeft ?? -1) >= 0);
-  const support = ents.find((e) => /support|forticare/i.test(e.type ?? ''));
+  const latest = latestEntitlements(a.entitlements, now);
+  const ents = latest.map((x) => x.row);
+  const future = latest.filter((x) => x.ms !== undefined && x.ms >= now).map((x) => x.row);
+  const supports = latest.filter((x) => /support|forticare/i.test(x.row.type ?? ''));
+  const support = supports.reduce<(typeof supports)[number] | undefined>(
+    (best, x) => (!best || (x.ms ?? -Infinity) > (best.ms ?? -Infinity) ? x : best),
+    undefined
+  )?.row;
   return compact({
     serial: clean(a.serialNumber, 40) ?? '?',
     model: clean(a.productModel, 80),

@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULTS, getConfig, parseBaseUrl, runWithConfig, scrub, setFetchForTests } from '../client.js';
 import { ALL_TOOLS, READ_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
-import { ZONELESS_DATE, clearCaches, compareFirmware, day, daysLeft, expireBefore, expiryOf, latestByType, parseDate } from '../tools/format.js';
+import { ZONELESS_DATE, assetRow, clearCaches, compareFirmware, day, daysLeft, expireBefore, expiryOf, latestByType, parseDate } from '../tools/format.js';
 import { wrapUntrusted } from '../tools/shared.js';
 import { ASSET, FGT, dataOf, fakeForticloud, json, textOf } from './test-helpers.js';
 import type { Call } from './test-helpers.js';
@@ -675,6 +675,62 @@ describe('expiry dates and time zones', () => {
       const out = dataOf(await call('forticloud_get_asset', { serial: 'FGT60FTK00000001' }));
       expect([tz, out.endOfOrder, out.endOfSupport]).toEqual([tz, '2030-01-01', '2030-01-01']);
     }
+  });
+
+  describe('two ends within the same 24 hours are told apart by their exact moment, in either order', () => {
+    const now = Date.parse('2030-01-01T12:00:00Z');
+    // Both are 10 days and some hours away, so both have daysLeft 10.
+    const earlier = { typeDesc: 'Enterprise Technical Support', endDate: '2030-01-11T13:00:00Z' };
+    const later = { typeDesc: 'Enterprise Technical Support', endDate: '2030-01-12T08:00:00Z' };
+
+    it('the latest entitlement of a type wins, whichever the API lists first', () => {
+      for (const order of [[earlier, later], [later, earlier]]) {
+        const rows = latestByType(order, now);
+        expect(rows).toEqual([{ type: 'Enterprise Technical Support', end: '2030-01-12', daysLeft: 10 }]);
+      }
+    });
+
+    it('supportEnd is the latest support end; nextExpiry the soonest end ahead', () => {
+      const premium = { typeDesc: 'FortiCare Premium Support', endDate: '2030-01-11T20:00:00Z' };
+      const fortiguard = { typeDesc: 'FortiGuard Web Filtering', endDate: '2030-01-11T14:00:00Z' };
+      for (const order of [[earlier, later, premium, fortiguard], [fortiguard, premium, later, earlier]]) {
+        const a = assetRow({ serialNumber: 'FGT60FTK00000001', entitlements: order }, now);
+        expect(a.supportEnd).toBe('2030-01-12');
+        expect(a.nextExpiry).toEqual({ type: 'FortiGuard Web Filtering', end: '2030-01-11', daysLeft: 10 });
+        expect((a.entitlements as any[]).map((e) => e.type)).toEqual([
+          'FortiGuard Web Filtering',
+          'FortiCare Premium Support',
+          'Enterprise Technical Support',
+        ]);
+      }
+    });
+
+    it('nextExpiry skips an end earlier today that has already passed', () => {
+      const past = { typeDesc: 'A', endDate: '2030-01-01T11:00:00Z' };
+      const soon = { typeDesc: 'B', endDate: '2030-01-01T13:00:00Z' };
+      for (const order of [[past, soon], [soon, past]]) {
+        expect(assetRow({ serialNumber: 'X0000', entitlements: order }, now).nextExpiry).toEqual({ type: 'B', end: '2030-01-01', daysLeft: 0 });
+      }
+    });
+
+    it('list_expiring and list_contracts order same-day ends by moment, whichever the API lists first', async () => {
+      const t = Date.now();
+      const a = { serialNumber: 'FGT60FTK00000001', entitlements: [{ typeDesc: 'Support', endDate: new Date(t + 5 * DAY + 20 * 3600_000).toISOString() }] };
+      const b = { serialNumber: 'FGT60FTK00000002', entitlements: [{ typeDesc: 'Support', endDate: new Date(t + 5 * DAY + 2 * 3600_000).toISOString() }] };
+      const c1 = { contractNumber: 'C0000001', terms: [{ endDate: new Date(t + 5 * DAY + 20 * 3600_000).toISOString() }] };
+      const c2 = { contractNumber: 'C0000002', terms: [{ endDate: new Date(t + 5 * DAY + 2 * 3600_000).toISOString() }] };
+      for (const [assets, contracts] of [[[a, b], [c1, c2]], [[b, a], [c2, c1]]]) {
+        clearCaches();
+        setFetchForTests(
+          fakeForticloud({
+            [`${ASSET}/products/list`]: json({ status: 0, totalPages: 1, assets }),
+            [`${ASSET}/contracts/list`]: json({ status: 0, contracts }),
+          }).fn
+        );
+        expect(dataOf(await call('forticloud_list_expiring')).entitlements.map((e: any) => e.serial)).toEqual(['FGT60FTK00000002', 'FGT60FTK00000001']);
+        expect(dataOf(await call('forticloud_list_contracts')).contracts.map((c: any) => c.contract)).toEqual(['C0000002', 'C0000001']);
+      }
+    });
   });
 
   it('a bad FORTICLOUD_TIME_ZONE is a config error', async () => {
