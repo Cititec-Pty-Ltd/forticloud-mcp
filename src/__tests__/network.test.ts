@@ -475,8 +475,13 @@ describe('forticloud_find_ip', () => {
       expect(out.partlySearchedDevices).toEqual([
         expect.objectContaining({
           serial: SN3,
-          notRead: failing.startsWith('cmdb') ? 'configured addresses (cmdb system/interface)' : 'live addresses (monitor system/interface)',
-          error: expect.stringMatching(/504/),
+          incomplete: [
+            {
+              read: failing.startsWith('cmdb') ? 'configured addresses (cmdb system/interface)' : 'live addresses (monitor system/interface)',
+              reason: 'failed',
+              error: expect.stringMatching(/504/),
+            },
+          ],
         }),
       ]);
       // What the other read gave is still used.
@@ -502,10 +507,42 @@ describe('forticloud_find_ip', () => {
     setFetchForTests(fn);
     const out = dataOf(await call('forticloud_find_ip', { query: '192.168.10.5' }));
     expect(out.failedDevices).toEqual([expect.objectContaining({ serial: SN, error: expect.stringMatching(/502/) })]);
-    expect(out.stoppedBecause).toMatch(/1 devices failed/);
+    expect(out.stoppedBecause).toMatch(/1 reads failed \(1 whole devices, 0 interface reads/);
     expect(out.skippedDevices).toEqual([expect.objectContaining({ serial: SN3, reason: 'not reached' })]);
     expect(out.complete).toBe(false);
     expect(fortiosCalls(calls).some((c) => c.url.pathname.includes(SN3))).toBe(false);
+  });
+
+  it('a failed interface read on a partly searched device counts toward the error budget; its other read is still matched', async () => {
+    FIND_IP_LIMITS.maxErrors = 1;
+    FIND_IP_LIMITS.concurrency = 1;
+    const { fn, calls } = fakeForticloud(fleet({ [FOS(SN, 'monitor/system/interface')]: json({ message: 'timed out' }, 504) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call('forticloud_find_ip', { query: '192.168.10.5' }));
+    expect(out.results).toEqual([expect.objectContaining({ serial: SN, interface: 'internal', source: 'configured' })]);
+    expect(out.partlySearchedDevices).toEqual([expect.objectContaining({ serial: SN, incomplete: [expect.objectContaining({ reason: 'failed' })] })]);
+    expect(out.failedDevices).toBeUndefined();
+    expect(out.stoppedBecause).toMatch(/1 reads failed \(0 whole devices, 1 interface reads on partly searched ones\)/);
+    expect(out.skippedDevices).toEqual([expect.objectContaining({ serial: SN3, reason: 'not reached' })]);
+    expect(out.complete).toBe(false);
+    expect(fortiosCalls(calls).some((c) => c.url.pathname.includes(SN3))).toBe(false);
+  });
+
+  it('an interface answer cut at the row cap leaves the device partly searched (truncated), not complete and not cached', async () => {
+    const many = Array.from({ length: FORTIOS_ENDPOINTS.interfaceConfig.maxItems + 1 }, (_, i) => ({ name: `vlan${i}`, type: 'vlan', ip: '0.0.0.0 0.0.0.0' }));
+    const { fn, calls } = fakeForticloud(fleet({ [FOS(SN3, 'cmdb/system/interface')]: json(envelope([...C_CONFIG, ...many])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call('forticloud_find_ip', { query: '192.168.10.5', account: 'client c' }));
+    expect(out.results).toEqual([expect.objectContaining({ serial: SN3, interface: 'lan' })]);
+    expect(out.partlySearchedDevices).toEqual([
+      expect.objectContaining({ serial: SN3, incomplete: [{ read: 'configured addresses (cmdb system/interface)', reason: 'truncated' }] }),
+    ]);
+    expect(out.devices).toMatchObject({ searched: 1, partlySearched: 1 });
+    expect(out.complete).toBe(false);
+    expect(out.stoppedBecause).toBeUndefined();
+    const before = fortiosCalls(calls).length;
+    await call('forticloud_find_ip', { query: '192.168.10.5', account: 'client c' });
+    expect(fortiosCalls(calls).length).toBe(before + 2);
   });
 
   it('a 429 stops the search with a structured rate_limited error', async () => {

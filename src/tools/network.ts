@@ -413,11 +413,21 @@ interface IfaceNet {
   source: 'configured' | 'live' | 'configured secondary' | 'configured and live';
 }
 
-/** A device's interface addresses; `missing` names the interface read that failed, when only one of the two answered. */
+/** An interface read that did not give every address: it failed (the other one answered), or its answer was cut at the row cap. */
+interface Incomplete {
+  read: string;
+  reason: 'failed' | 'truncated';
+  error?: string;
+}
+
+/** A device's interface addresses; `incomplete` lists the reads that did not give them all. */
 interface DeviceNets {
   nets: IfaceNet[];
-  missing?: { read: string; error: string };
+  incomplete?: Incomplete[];
 }
+
+const CONFIG_READ = 'configured addresses (cmdb system/interface)';
+const LIVE_READ = 'live addresses (monitor system/interface)';
 
 const ifaceCache = new Map<string, { at: number; value: Promise<DeviceNets> }>();
 
@@ -428,19 +438,22 @@ export function clearNetworkCaches(): void {
 /**
  * One device's interface addresses (configured, secondary and live), from both
  * interface endpoints. When only one answers, the addresses it gave are kept
- * and `missing` says which read failed: a DHCP or PPPoE WAN address is only in
- * the live read, so the device was not fully searched.
+ * and `incomplete` says which read failed (a DHCP or PPPoE WAN address is only
+ * in the live read); an answer cut at the endpoint's row cap is listed too.
+ * Either way the device was not fully searched.
  */
 async function deviceNets(api: Api, sn: string): Promise<DeviceNets> {
   const [cfg, live] = await Promise.allSettled([api.fortios(sn, 'interfaceConfig'), api.fortios(sn, 'interfaceLive')]);
   for (const r of [cfg, live]) if (r.status === 'rejected') rethrowRateLimit(r.reason);
   if (cfg.status === 'rejected' && live.status === 'rejected') throw cfg.reason;
-  const missing =
-    cfg.status === 'rejected'
-      ? { read: 'configured addresses (cmdb system/interface)', error: partError(cfg.reason) }
-      : live.status === 'rejected'
-        ? { read: 'live addresses (monitor system/interface)', error: partError(live.reason) }
-        : undefined;
+  const incomplete: Incomplete[] = [];
+  for (const [r, read] of [
+    [cfg, CONFIG_READ],
+    [live, LIVE_READ],
+  ] as const) {
+    if (r.status === 'rejected') incomplete.push({ read, reason: 'failed', error: partError(r.reason) });
+    else if (r.value.truncated) incomplete.push({ read, reason: 'truncated' });
+  }
   const meta = new Map<string, Omit<IfaceNet, 'net' | 'source'>>();
   const nets: IfaceNet[] = [];
   const push = (n: Net | undefined, name: string, source: IfaceNet['source']) => {
@@ -473,10 +486,10 @@ async function deviceNets(api: Api, sn: string): Promise<DeviceNets> {
     const name = String(l.name ?? '');
     if (name) push(parseFortiosNet(l.ip, l.mask), name, 'live');
   }
-  return missing ? { nets, missing } : { nets };
+  return incomplete.length ? { nets, incomplete } : { nets };
 }
 
-/** A device's addresses, reused for cacheMs. Only a full read (both endpoints) is cached; a failed or partial one is read again next call. */
+/** A device's addresses, reused for cacheMs. Only a full read (both endpoints, neither cut) is cached; a failed, partial or truncated one is read again next call. */
 function cachedNets(api: Api, sn: string): { value: Promise<DeviceNets>; cached: boolean } {
   const key = `${api.cacheKey}|${sn}`;
   const hit = ifaceCache.get(key);
@@ -487,7 +500,7 @@ function cachedNets(api: Api, sn: string): { value: Promise<DeviceNets>; cached:
   const drop = () => {
     if (ifaceCache.get(key) === entry) ifaceCache.delete(key);
   };
-  value.then((r) => r.missing && drop(), drop);
+  value.then((r) => r.incomplete && drop(), drop);
   return { value, cached: false };
 }
 
@@ -511,6 +524,12 @@ async function findIp(args: Raw, api: Api) {
   const matches: (Raw & { _order: number; _prefix: number })[] = [];
   const errors: Raw[] = [];
   const partials: Raw[] = [];
+  /** Failed devices plus failed interface reads on partly searched ones; the error budget counts both. */
+  let failures = 0;
+  const failed = () => {
+    failures++;
+    if (failures >= FIND_IP_LIMITS.maxErrors) stopped = 'errors';
+  };
   let searched = 0;
   let fromCache = 0;
   let stopped: 'budget' | 'errors' | undefined;
@@ -531,7 +550,7 @@ async function findIp(args: Raw, api: Api) {
       started.add(d.serial);
       const { value, cached } = cachedNets(api, d.serial);
       try {
-        const { nets, missing } = await value;
+        const { nets, incomplete } = await value;
         // A device that answered after the budget ran out is not counted (its answer is cached for the next call).
         if (Date.now() > deadline && !cached) {
           stopped ??= 'budget';
@@ -540,7 +559,11 @@ async function findIp(args: Raw, api: Api) {
         searched++;
         if (cached) fromCache++;
         finished.add(d.serial);
-        if (missing) partials.push(compact({ serial: d.serial, device: d.name, account: d.account, notRead: missing.read, error: missing.error }));
+        if (incomplete) {
+          partials.push(compact({ serial: d.serial, device: d.name, account: d.account, incomplete }));
+          // The addresses from the read that worked are still matched below.
+          for (const i of incomplete) if (i.reason === 'failed') failed();
+        }
         for (const n of nets) {
           const rel = relate(q, n.net);
           if (!rel) continue;
@@ -571,7 +594,7 @@ async function findIp(args: Raw, api: Api) {
           return;
         }
         errors.push(compact({ serial: d.serial, device: d.name, account: d.account, error: partError(err) }));
-        if (errors.length >= FIND_IP_LIMITS.maxErrors) stopped = 'errors';
+        failed();
       }
     }
   };
@@ -621,7 +644,7 @@ async function findIp(args: Raw, api: Api) {
       stopped === 'budget' && skipped.length
         ? `the ${Math.round(FIND_IP_LIMITS.budgetMs / 1000)} s time budget ran out; call again to continue (devices already read are cached for ${Math.round(FIND_IP_LIMITS.cacheMs / 60_000)} min)`
         : stopped === 'errors'
-          ? `${errors.length} devices failed, so no more were asked (FortiGate Cloud allows few errors a minute)`
+          ? `${failures} reads failed (${errors.length} whole devices, ${failures - errors.length} interface reads on partly searched ones), so no more devices were asked (FortiGate Cloud allows few errors a minute)`
           : undefined,
     skippedDevices: skipped.length ? skipped.slice(0, 100).map((d) => ({ ...describe(d), reason: started.has(d.serial) ? 'still reading when the budget ran out' : 'not reached' })) : undefined,
     partlySearchedDevices: partials.length ? [...partials] : undefined,
