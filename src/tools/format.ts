@@ -1,0 +1,341 @@
+import type { Api } from '../client.js';
+import { InputError, clean, compact, num } from './shared.js';
+
+type Raw = Record<string, unknown>;
+
+const DAY_MS = 86_400_000;
+
+// --- Values ------------------------------------------------------------------------------------
+
+/**
+ * A FortiCloud date as epoch ms. Asset Management writes ISO 8601 with offsets
+ * like "-8:00" (one-digit hour), which Date.parse rejects, so the offset is
+ * padded first. Numbers are epoch seconds (or ms when that large). 0 is none.
+ */
+export function parseDate(value: unknown): number | undefined {
+  if (typeof value === 'number') {
+    if (!Number.isFinite(value) || value <= 0) return undefined;
+    return value > 1e12 ? value : value * 1000;
+  }
+  if (typeof value !== 'string' || !value.trim()) return undefined;
+  const s = value.trim().replace(/([+-])(\d):(\d\d)$/, '$10$2:$3');
+  if (/^\d+$/.test(s)) return parseDate(Number(s));
+  // No zone given ("2030-01-01T00:00:00"): read as UTC, not as this machine's local time.
+  const zoned = /^\d{4}-\d\d-\d\d$/.test(s) ? `${s}T00:00:00Z` : /^\d{4}-\d\d-\d\dT[\d:.]+$/.test(s) ? `${s}Z` : s;
+  const ms = Date.parse(zoned);
+  return Number.isNaN(ms) ? undefined : ms;
+}
+
+/** YYYY-MM-DD (UTC) of a FortiCloud date; undefined when there is none. */
+export function day(value: unknown): string | undefined {
+  const ms = parseDate(value);
+  return ms === undefined ? undefined : new Date(ms).toISOString().slice(0, 10);
+}
+
+/** ISO date-time (UTC, seconds) of a FortiCloud date. */
+export function stamp(value: unknown): string | undefined {
+  const ms = parseDate(value);
+  return ms === undefined ? undefined : new Date(ms).toISOString().replace(/\.\d{3}Z$/, 'Z');
+}
+
+/** Whole days from `now` to the date (negative when past). */
+export function daysLeft(value: unknown, now = Date.now()): number | undefined {
+  const ms = parseDate(value);
+  return ms === undefined ? undefined : Math.floor((ms - now) / DAY_MS);
+}
+
+/** The cut-off date Asset Management's expireBefore takes, `days` from now. */
+export function expireBefore(days: number, now = Date.now()): string {
+  return `${new Date(now + days * DAY_MS).toISOString().slice(0, 10)}T23:59:59+00:00`;
+}
+
+const bool = (v: unknown): boolean | undefined =>
+  typeof v === 'boolean' ? v : typeof v === 'string' && /^(true|false)$/i.test(v) ? /^true$/i.test(v) : undefined;
+
+/** A FortiCloud serial number: letters, digits and dashes. Used in paths, so strict. */
+export function checkSerial(value: unknown, key = 'serial'): string {
+  const s = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  if (!/^[A-Z0-9-]{4,40}$/.test(s)) throw new InputError(`${key} must be a serial number (letters, digits and dashes)`);
+  return s;
+}
+
+/** A serial-number pattern for Asset Management (it matches serials that start with it). */
+export function checkSerialPattern(value: unknown, key = 'serial_prefix'): string {
+  const s = typeof value === 'string' ? value.trim().toUpperCase() : '';
+  if (!/^[A-Z0-9-]{1,40}$/.test(s)) throw new InputError(`${key} must be letters, digits and dashes`);
+  return s;
+}
+
+/**
+ * Generic, bounded copy of an object of unknown shape: strings cleaned and
+ * cut, nested objects kept to `depth`, arrays to `maxItems`. For fields whose
+ * exact shape is not documented publicly.
+ */
+export function tidy(value: unknown, depth = 3, maxItems = 50): unknown {
+  if (value === null || value === undefined) return undefined;
+  if (typeof value === 'string') return clean(value, 300);
+  if (typeof value === 'number' || typeof value === 'boolean') return value;
+  if (depth <= 0) return undefined;
+  if (Array.isArray(value)) {
+    const items = value.slice(0, maxItems).map((v) => tidy(v, depth - 1, maxItems)).filter((v) => v !== undefined);
+    return items.length ? items : undefined;
+  }
+  if (typeof value === 'object') {
+    const out: Raw = {};
+    for (const [k, v] of Object.entries(value as Raw).slice(0, 80)) {
+      const t = tidy(v, depth - 1, maxItems);
+      if (t !== undefined && t !== '') out[k] = t;
+    }
+    return Object.keys(out).length ? out : undefined;
+  }
+  return undefined;
+}
+
+/** Contains, ignoring case. */
+export const has = (hay: unknown, needle: string | undefined): boolean =>
+  needle === undefined || (typeof hay === 'string' && hay.toLowerCase().includes(needle.toLowerCase()));
+
+/** A page of an in-memory list, with the paging fields every list returns. */
+export function pageOf<T>(items: T[], limit: number, offset: number) {
+  const slice = items.slice(offset, offset + limit);
+  return {
+    total: items.length,
+    count: slice.length,
+    offset,
+    ...(offset + slice.length < items.length ? { nextOffset: offset + slice.length } : {}),
+    items: slice,
+  };
+}
+
+// --- FortiGate Cloud devices ---------------------------------------------------------------------
+
+/** Field names seen or expected for a "last seen" time; the public docs show none. */
+const LAST_SEEN_FIELDS = [
+  'lastSeen', 'lastSeenTime', 'lastConnectTime', 'lastConnectedTime', 'lastConnected', 'lastUpdateTime',
+  'lastUpdate', 'lastHeartbeat', 'lastLogTime', 'lastLoginTime',
+];
+/** Field names that may carry a connection state as text. */
+const CONNECTION_FIELDS = ['connectionStatus', 'connectStatus', 'connStatus', 'tunnelStatus', 'managementStatus'];
+
+export type Connection = 'online' | 'offline' | 'unknown';
+
+/**
+ * Whether the FortiGate's management tunnel to FortiGate Cloud is up. The
+ * documented field is `tunnelAlive`; a text status field, if the API returns
+ * one, is passed on as `connectionDetail`.
+ */
+export function connectionOf(d: Raw): { connection: Connection; connectionDetail?: string } {
+  const detail = CONNECTION_FIELDS.map((k) => clean(d[k], 40)).find(Boolean);
+  const alive = bool(d.tunnelAlive);
+  let connection: Connection = alive === true ? 'online' : alive === false ? 'offline' : 'unknown';
+  if (connection === 'unknown' && detail) {
+    if (/^(up|online|connected|good|ok|alive)$/i.test(detail)) connection = 'online';
+    else if (/^(down|offline|disconnected|lost|dead)$/i.test(detail)) connection = 'offline';
+  }
+  return { connection, ...(detail ? { connectionDetail: detail } : {}) };
+}
+
+export function lastSeenOf(d: Raw): string | undefined {
+  for (const k of LAST_SEEN_FIELDS) {
+    const s = stamp(d[k]);
+    if (s) return s;
+  }
+  return undefined;
+}
+
+export interface DeviceRow {
+  serial: string;
+  name?: string;
+  model?: string;
+  firmware?: string;
+  connection: Connection;
+  connectionDetail?: string;
+  lastSeen?: string;
+  account?: string;
+  accountId?: number;
+  managedByFortiGateCloud?: boolean;
+  fortigateCloudContractEnd?: string;
+  trial?: boolean;
+}
+
+/** One device from FortiGate Cloud's /devices, trimmed to the useful fields. */
+export function deviceRow(d: Raw, accounts?: Map<number, string>): DeviceRow {
+  const accountId = num(d.subAccountOid ?? d.subAccountId ?? d.accountId);
+  return compact({
+    serial: clean(d.sn ?? d.serialNumber ?? d.serial, 40) ?? '?',
+    name: clean(d.name ?? d.hostname ?? d.hostName, 120),
+    model: clean(d.model ?? d.platform, 60),
+    firmware: clean(d.firmwareVersion ?? d.firmware ?? d.version, 40),
+    ...connectionOf(d),
+    lastSeen: lastSeenOf(d),
+    account: accountId !== undefined ? (accounts?.get(accountId) ?? (accountId === -1 ? '<Default>' : undefined)) : undefined,
+    accountId,
+    managedByFortiGateCloud: bool(d.management),
+    fortigateCloudContractEnd: day(d.contractEndTime),
+    trial: bool(d.trial),
+  }) as DeviceRow;
+}
+
+/** The array in a FortiGate Cloud list answer: a bare array, or one under data/devices/items/result. */
+export function listOf(body: unknown): Raw[] {
+  if (Array.isArray(body)) return body.filter((x): x is Raw => !!x && typeof x === 'object');
+  if (body && typeof body === 'object') {
+    for (const k of ['data', 'devices', 'items', 'result', 'results', 'subaccounts']) {
+      const v = (body as Raw)[k];
+      if (Array.isArray(v)) return listOf(v);
+    }
+  }
+  return [];
+}
+
+const DEVICE_PAGE = 500;
+const MAX_DEVICE_PAGES = 10;
+const CACHE_MS = 60_000;
+const ACCOUNT_CACHE_MS = 5 * 60_000;
+
+const deviceCache = new Map<string, { at: number; value: Promise<{ devices: Raw[]; complete: boolean }> }>();
+const accountCache = new Map<string, { at: number; value: Promise<Map<number, string> | null> }>();
+
+export function clearCaches(): void {
+  deviceCache.clear();
+  accountCache.clear();
+}
+
+/**
+ * Every FortiGate in FortiGate Cloud. /devices is paged with limit and offset
+ * (as open-source clients use it); the loop stops on a short page, when a page
+ * adds no new serial (paging ignored), at the `total` the items carry, or
+ * after ten pages. Cached for a minute, so one conversation's lookups make one
+ * request.
+ */
+export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolean }> {
+  const key = api.config.fgtUrl;
+  const hit = deviceCache.get(key);
+  if (hit && Date.now() - hit.at < CACHE_MS) return hit.value;
+  const value = (async () => {
+    const seen = new Map<string, Raw>();
+    let complete = false;
+    for (let page = 0; page < MAX_DEVICE_PAGES; page++) {
+      const items = listOf(await api.fgt('/devices', { limit: DEVICE_PAGE, offset: page * DEVICE_PAGE }));
+      const before = seen.size;
+      for (const d of items) {
+        const sn = String(d.sn ?? d.serialNumber ?? '');
+        if (sn && !seen.has(sn)) seen.set(sn, d);
+      }
+      const total = num(items[0]?.total);
+      if (items.length < DEVICE_PAGE || seen.size === before || (total !== undefined && seen.size >= total)) {
+        complete = true;
+        break;
+      }
+    }
+    return { devices: [...seen.values()], complete };
+  })();
+  deviceCache.set(key, { at: Date.now(), value });
+  value.catch(() => deviceCache.delete(key));
+  return value;
+}
+
+/** FortiGate Cloud sub-accounts (an MSSP's client accounts) by ID; null when the API refuses. */
+export function accountNames(api: Api): Promise<Map<number, string> | null> {
+  const key = api.config.fgtUrl;
+  const hit = accountCache.get(key);
+  if (hit && Date.now() - hit.at < ACCOUNT_CACHE_MS) return hit.value;
+  const value = api
+    .fgt('/subaccounts')
+    .then((body) => {
+      const map = new Map<number, string>();
+      for (const a of listOf(body)) {
+        const id = num(a.oid ?? a.id ?? a.accountId);
+        const name = clean(a.name ?? a.accountName, 120);
+        if (id !== undefined && name) map.set(id, name);
+      }
+      return map;
+    })
+    .catch(() => null);
+  accountCache.set(key, { at: Date.now(), value });
+  return value;
+}
+
+/** Sub-accounts with their parent, for forticloud_list_accounts. */
+export function accountRows(body: unknown) {
+  return listOf(body).map((a) =>
+    compact({ accountId: num(a.oid ?? a.id ?? a.accountId), name: clean(a.name ?? a.accountName, 120), parentId: num(a.parent ?? a.parentId) })
+  );
+}
+
+/** Compares firmware strings like "7.2.8" or "v7.4.3,build2573" numerically; unknown last. */
+export function compareFirmware(a: string | undefined, b: string | undefined): number {
+  const parts = (s: string | undefined) => (s?.match(/\d+/g) ?? []).slice(0, 4).map(Number);
+  const pa = parts(a);
+  const pb = parts(b);
+  if (!pa.length || !pb.length) return pa.length ? -1 : pb.length ? 1 : 0;
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] ?? 0) - (pb[i] ?? 0);
+    if (d) return d;
+  }
+  return 0;
+}
+
+// --- Asset Management ------------------------------------------------------------------------------
+
+export interface EntitlementRow {
+  type?: string;
+  level?: string;
+  start?: string;
+  end?: string;
+  daysLeft?: number;
+}
+
+export function entitlementRow(e: Raw, now = Date.now()): EntitlementRow {
+  return compact({
+    type: clean(e.typeDesc ?? e.type, 80),
+    level: clean(e.levelDesc ?? e.level, 60),
+    start: day(e.startDate),
+    end: day(e.endDate ?? e.expirationDate ?? e.experiationDate),
+    daysLeft: daysLeft(e.endDate ?? e.expirationDate ?? e.experiationDate, now),
+  }) as EntitlementRow;
+}
+
+/**
+ * The latest entitlement of each type. A renewed service keeps its old,
+ * ended entitlement next to the new one; only the latest end date counts.
+ */
+export function latestByType(entitlements: unknown, now = Date.now()): EntitlementRow[] {
+  const best = new Map<string, EntitlementRow>();
+  for (const e of Array.isArray(entitlements) ? entitlements : []) {
+    if (!e || typeof e !== 'object') continue;
+    const row = entitlementRow(e as Raw, now);
+    const key = row.type ?? '?';
+    const cur = best.get(key);
+    if (!cur || (row.daysLeft ?? -Infinity) > (cur.daysLeft ?? -Infinity)) best.set(key, row);
+  }
+  return [...best.values()].sort((a, b) => (a.daysLeft ?? Infinity) - (b.daysLeft ?? Infinity));
+}
+
+/** One asset (registered product) from products/list or products/details, trimmed. */
+export function assetRow(a: Raw, now = Date.now()) {
+  const ents = latestByType(a.entitlements, now);
+  const future = ents.filter((e) => (e.daysLeft ?? -1) >= 0);
+  const support = ents.find((e) => /support|forticare/i.test(e.type ?? ''));
+  return compact({
+    serial: clean(a.serialNumber, 40) ?? '?',
+    model: clean(a.productModel, 80),
+    description: clean(a.description, 200),
+    folder: clean(a.folderPath ?? a.folderName, 200),
+    accountId: num(a.accountId),
+    status: clean(a.status, 40),
+    registered: day(a.registrationDate),
+    decommissioned: bool(a.isDecommissioned),
+    endOfOrder: day(a.productModelEoR),
+    endOfSupport: day(a.productModelEoS),
+    supportEnd: support?.end,
+    nextExpiry: future[0] ? compact({ type: future[0].type, end: future[0].end, daysLeft: future[0].daysLeft }) : undefined,
+    entitlements: ents.length ? ents : undefined,
+  });
+}
+
+/** The asset array in a products/list answer (null when there are none). */
+export function assetsOf(body: Raw): Raw[] {
+  const v = body.assets ?? body.products;
+  return Array.isArray(v) ? v.filter((x): x is Raw => !!x && typeof x === 'object') : [];
+}
