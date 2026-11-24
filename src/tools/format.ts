@@ -205,11 +205,12 @@ export function clearCaches(): void {
  * Every FortiGate in FortiGate Cloud. /devices is paged with limit and offset
  * (as open-source clients use it); the loop stops on a short page, when a page
  * adds no new serial (paging ignored), at the `total` the items carry, or
- * after ten pages. Cached for a minute, so one conversation's lookups make one
+ * after ten pages. `complete` is true only when a short page or `total` shows
+ * the whole fleet was read. Cached for a minute, so one conversation's lookups make one
  * request.
  */
 export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolean }> {
-  const key = api.config.fgtUrl;
+  const key = api.cacheKey;
   const hit = deviceCache.get(key);
   if (hit && Date.now() - hit.at < CACHE_MS) return hit.value;
   const value = (async () => {
@@ -223,10 +224,17 @@ export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolea
         if (sn && !seen.has(sn)) seen.set(sn, d);
       }
       const total = num(items[0]?.total);
-      if (items.length < DEVICE_PAGE || seen.size === before || (total !== undefined && seen.size >= total)) {
+      if (total !== undefined && seen.size >= total) {
         complete = true;
         break;
       }
+      if (items.length < DEVICE_PAGE) {
+        // The last page; it is the whole fleet unless the items say there are more.
+        complete = total === undefined || seen.size >= total;
+        break;
+      }
+      if (seen.size === before) break; // offset ignored: a repeated full page proves nothing about the rest
+
     }
     return { devices: [...seen.values()], complete };
   })();
@@ -237,7 +245,7 @@ export function allDevices(api: Api): Promise<{ devices: Raw[]; complete: boolea
 
 /** FortiGate Cloud sub-accounts (an MSSP's client accounts) by ID; null when the API refuses. */
 export function accountNames(api: Api): Promise<Map<number, string> | null> {
-  const key = api.config.fgtUrl;
+  const key = api.cacheKey;
   const hit = accountCache.get(key);
   if (hit && Date.now() - hit.at < ACCOUNT_CACHE_MS) return hit.value;
   const value = api

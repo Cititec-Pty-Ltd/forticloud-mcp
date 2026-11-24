@@ -354,6 +354,8 @@ export interface Api {
   /** Issues (or reuses) the token for a portal; for the status tool. */
   token(portal: Portal): Promise<{ secondsLeft?: number }>;
   readonly config: Pick<ForticloudConfig, 'assetUrl' | 'fgtUrl' | 'authUrl' | 'assetClientId' | 'fgtClientId'>;
+  /** Identifies the API user and endpoints, so caches never cross from one configuration to another. */
+  readonly cacheKey: string;
 }
 
 export function makeApi(config: ForticloudConfig): Api {
@@ -365,6 +367,7 @@ export function makeApi(config: ForticloudConfig): Api {
       assetClientId: config.assetClientId,
       fgtClientId: config.fgtClientId,
     },
+    cacheKey: [config.authUrl, config.fgtUrl, config.fgtClientId, config.apiId].join('|'),
     async asset<T>(path: string, body: Record<string, unknown>) {
       if (!ASSET_READS.has(path)) throw new Error(`Not an Asset Management read endpoint: ${path}`);
       const out = await portalRequest<Record<string, unknown>>(config, 'asset', 'POST', path, { body });
