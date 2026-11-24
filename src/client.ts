@@ -1,9 +1,12 @@
 import { AsyncLocalStorage } from 'node:async_hooks';
+import { gunzipSync } from 'node:zlib';
 import { logger } from './utils/logger.js';
 import { fetchWithRateLimitRetry } from './rate-limit.js';
 import type { FetchFn } from './rate-limit.js';
 import { ForticloudApiError, ForticloudAuthError, ForticloudRateLimitError } from './types.js';
 import type { ForticloudConfig, Portal } from './types.js';
+import { FORTIOS_ENDPOINTS, filterFortios } from './fortios.js';
+import type { FortiosEndpointName, FortiosResult } from './fortios.js';
 
 /** Largest response body read, in characters. */
 const MAX_RESPONSE_CHARS = 20_000_000;
@@ -172,6 +175,25 @@ interface RawResult {
 }
 
 /**
+ * The body as text. FortiOS 7+ answers through the FortiGate Cloud proxy can
+ * arrive gzipped: fetch undoes a Content-Encoding it recognises, and anything
+ * still starting with the gzip magic bytes (1f 8b) is unzipped here, capped at
+ * the same size as any other answer.
+ */
+export function decodeBody(bytes: Uint8Array, label: string, status: number): string {
+  let buf = Buffer.from(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+  if (buf.length >= 2 && buf[0] === 0x1f && buf[1] === 0x8b) {
+    try {
+      buf = gunzipSync(buf, { maxOutputLength: MAX_RESPONSE_CHARS });
+    } catch (err) {
+      const tooLarge = (err as { code?: string }).code === 'ERR_BUFFER_TOO_LARGE' || /larger than|too large/i.test((err as Error).message);
+      throw new ForticloudApiError(`FortiCloud ${label}: ${tooLarge ? 'response too large' : 'the gzipped answer could not be unzipped'}`, status);
+    }
+  }
+  return buf.toString('utf8');
+}
+
+/**
  * One HTTP request. `read` marks it replay-safe (every request this server
  * makes is a read, including Asset Management's POST queries and the token
  * request), so a short 429 is retried once. Throws ForticloudRateLimitError
@@ -207,7 +229,12 @@ async function send(
     await res.body?.cancel().catch(() => undefined);
     throw new ForticloudApiError(`FortiCloud ${label}: response too large (${length} bytes)`, res.status);
   }
-  const text = result.body ?? (await res.text());
+  let text = result.body;
+  if (text === undefined) {
+    const bytes = new Uint8Array(await res.arrayBuffer());
+    if (bytes.byteLength > MAX_RESPONSE_CHARS) throw new ForticloudApiError(`FortiCloud ${label}: response too large`, res.status);
+    text = decodeBody(bytes, label, res.status);
+  }
   if (text.length > MAX_RESPONSE_CHARS) throw new ForticloudApiError(`FortiCloud ${label}: response too large`, res.status);
   return { status: res.status, text };
 }
@@ -317,7 +344,7 @@ export async function portalRequest<T = unknown>(
   portal: Portal,
   method: 'GET' | 'POST',
   path: string,
-  options: { query?: Record<string, string | number | undefined>; body?: unknown } = {}
+  options: { query?: Record<string, string | number | undefined>; body?: unknown; timeoutMs?: number } = {}
 ): Promise<T> {
   const base = portal === 'asset' ? config.assetUrl : config.fgtUrl;
   if (!/^\/[A-Za-z0-9/_.-]*$/.test(path) || path.includes('..')) throw new Error(`Bad API path: ${path}`);
@@ -329,7 +356,7 @@ export async function portalRequest<T = unknown>(
   let result: RawResult | undefined;
   for (let attempt = 0; attempt < 2; attempt++) {
     const token = await getToken(config, portal, attempt > 0);
-    result = await send(config, method, url.toString(), label, { Authorization: `Bearer ${token}` }, body);
+    result = await send(config, method, url.toString(), label, { Authorization: `Bearer ${token}` }, body, options.timeoutMs);
     if (result.status !== 401) break;
   }
   const { status, text } = result as RawResult;
@@ -362,12 +389,76 @@ export const ASSET_NO_RECORDS = 1008;
 /** Asset Management read endpoints. Every other v3 endpoint writes and is not reachable here. */
 const ASSET_READS = new Set(['/products/list', '/products/details', '/contracts/list', '/licenses/list', '/folders/list']);
 
+// --- FortiOS through the FortiGate Cloud proxy ------------------------------------------------------
+
+/** Longest wait for one FortiOS answer through the proxy (the device answers, not FortiGate Cloud). */
+export const FORTIOS_TIMEOUT_MS = 20_000;
+/** FortiOS reads in flight at once, across every tool call in this process. */
+export const FORTIOS_CONCURRENCY = 6;
+
+let fortiosActive = 0;
+const fortiosQueue: (() => void)[] = [];
+
+/** Runs `fn` when fewer than FORTIOS_CONCURRENCY FortiOS reads are in flight. */
+async function fortiosSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (fortiosActive >= FORTIOS_CONCURRENCY) await new Promise<void>((resolve) => fortiosQueue.push(resolve));
+  fortiosActive++;
+  try {
+    return await fn();
+  } finally {
+    fortiosActive--;
+    fortiosQueue.shift()?.();
+  }
+}
+
+/** A FortiOS VDOM name. */
+const VDOM_RE = /^[A-Za-z0-9_.-]{1,31}$/;
+
+/**
+ * One read from a FortiGate's FortiOS REST API through FortiGate Cloud:
+ * GET {fgtUrl}/fgt/{serial}/api/v2/{path}. Only GET, only the endpoints in
+ * FORTIOS_ENDPOINTS (by name, never a path from a caller), only the
+ * allowlisted fields of each are returned. It goes through portalRequest, so
+ * it has the FortiGate Cloud token, the 401 retry and the fleet 429 policy;
+ * at most FORTIOS_CONCURRENCY run at once.
+ */
+export async function fortiosRequest(
+  config: ForticloudConfig,
+  serial: string,
+  name: FortiosEndpointName,
+  options: { vdom?: string } = {}
+): Promise<FortiosResult> {
+  const endpoint = FORTIOS_ENDPOINTS[name];
+  if (!endpoint) throw new Error(`Not a FortiOS read endpoint: ${String(name)}`);
+  const sn = serial.trim().toUpperCase();
+  if (!/^[A-Z0-9-]{4,40}$/.test(sn)) throw new Error('Bad serial number');
+  if (options.vdom !== undefined && !VDOM_RE.test(options.vdom)) throw new Error('Bad VDOM name');
+  const query: Record<string, string> = { ...('query' in endpoint ? endpoint.query : {}) };
+  if (options.vdom !== undefined) query.vdom = options.vdom;
+  const label = `FortiOS ${endpoint.path}`;
+  const body = await fortiosSlot(() =>
+    portalRequest<unknown>(config, 'fgt', 'GET', `/fgt/${sn}/api/v2/${endpoint.path}`, { query, timeoutMs: FORTIOS_TIMEOUT_MS })
+  );
+  // FortiOS reports its own errors in the body: {status: "error", http_status: 404, ...}.
+  const env = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
+  const inner = Number(env.http_status);
+  if (env.status === 'error' || (Number.isFinite(inner) && inner >= 400)) {
+    const status = Number.isFinite(inner) ? inner : undefined;
+    const detail = errorDetail(JSON.stringify({ message: env.message, error: env.error }), config);
+    throw new ForticloudApiError(`${label} on ${sn}: FortiOS answered with an error${status ? ` (HTTP ${status})` : ''}${detail ? ` - ${detail}` : ''}`, status);
+  }
+  if (env.results === undefined) throw new ForticloudApiError(`${label} on ${sn}: the answer has no results`);
+  return filterFortios(body, endpoint);
+}
+
 /** The read-only API handed to tools. */
 export interface Api {
   /** POST to an Asset Management read endpoint; body `status` checked (1008 = no records gives `{}` fields empty). */
   asset<T = Record<string, unknown>>(path: string, body: Record<string, unknown>): Promise<T & { status?: number }>;
   /** GET from FortiGate Cloud. */
   fgt<T = unknown>(path: string, query?: Record<string, string | number | undefined>): Promise<T>;
+  /** GET one allowlisted FortiOS endpoint on a FortiGate through FortiGate Cloud; only allowlisted fields come back. */
+  fortios(serial: string, endpoint: FortiosEndpointName, options?: { vdom?: string }): Promise<FortiosResult>;
   /** Issues (or reuses) the token for a portal; for the status tool. */
   token(portal: Portal): Promise<{ secondsLeft?: number }>;
   readonly config: Pick<ForticloudConfig, 'assetUrl' | 'fgtUrl' | 'authUrl' | 'assetClientId' | 'fgtClientId'>;
@@ -396,6 +487,7 @@ export function makeApi(config: ForticloudConfig): Api {
       return { ...(out as object), status } as T & { status?: number };
     },
     fgt: (path, query) => portalRequest(config, 'fgt', 'GET', path, { query }),
+    fortios: (serial, endpoint, options) => fortiosRequest(config, serial, endpoint, options),
     async token(portal) {
       await getToken(config, portal);
       return { secondsLeft: tokenSecondsLeft(config, portal) };

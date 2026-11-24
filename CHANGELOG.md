@@ -4,6 +4,25 @@ Releases are cut by semantic-release from the commit messages on `main` (the
 "Cititec release" workflow); it adds an entry above this line for each release
 and publishes the image to `ghcr.io/cititec-pty-ltd/forticloud-mcp`.
 
+## 1.1.0
+
+Read-only network tools, through FortiGate Cloud's FortiOS API proxy.
+
+- 2 new tools (14 in all): `forticloud_get_network` (interfaces, DHCP, routes,
+  VIPs, IPsec VPNs and address objects of one FortiGate, live or configured)
+  and `forticloud_find_ip` (which client, device, interface and VLAN an IPv4
+  address or subnet belongs to).
+- A FortiOS proxy helper in the client: GET only, a fixed list of endpoints,
+  an optional VDOM, and a per-endpoint field allowlist applied before
+  anything leaves the client, so secrets (PPPoE passwords, 802.1X keys,
+  pre-shared keys, certificates) never appear. At most 6 reads in flight;
+  gzipped answers are unzipped.
+- `forticloud_find_ip` reads online devices 4 at a time within a 45 s budget,
+  caches each fully read device for 10 minutes, marks a device whose live or
+  configured interface read failed as partly searched (`complete: false`, not
+  cached), stops after 6 failed devices, and
+  returns partial results naming the skipped and offline devices.
+
 ## 1.0.0
 
 First release: a read-only MCP server for Fortinet FortiCloud (FortiGate Cloud

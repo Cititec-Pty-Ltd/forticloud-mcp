@@ -1,7 +1,7 @@
 {
   "name": "@cititec-pty-ltd/forticloud-mcp",
   "version": "0.1.0",
-  "description": "MCP server for Fortinet FortiCloud: FortiGate inventory, connectivity, firmware and config backups (FortiGate Cloud) and contracts, entitlements and expiry (Asset Management), read-only",
+  "description": "MCP server for Fortinet FortiCloud: FortiGate inventory, connectivity, firmware, config backups and network (FortiGate Cloud) and contracts, entitlements and expiry (Asset Management), read-only",
   "type": "module",
   "main": "./dist/index.js",
   "bin": {

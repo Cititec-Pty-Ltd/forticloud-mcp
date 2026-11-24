@@ -53,6 +53,30 @@ export function day(value: unknown, timeZone: string = displayTimeZone()): strin
   return new Intl.DateTimeFormat('en-CA', { timeZone, year: 'numeric', month: '2-digit', day: '2-digit' }).format(ms);
 }
 
+/**
+ * A moment as local date and time in FORTICLOUD_TIME_ZONE, with the zone:
+ * "2030-01-31 14:05:09 Australia/Melbourne". For "read at" times.
+ */
+export function timeIn(value: unknown, timeZone: string = displayTimeZone()): string | undefined {
+  const ms = parseDate(value);
+  if (ms === undefined) return undefined;
+  const parts = Object.fromEntries(
+    new Intl.DateTimeFormat('en-CA', {
+      timeZone,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit',
+      hour: '2-digit',
+      minute: '2-digit',
+      second: '2-digit',
+      hourCycle: 'h23',
+    })
+      .formatToParts(ms)
+      .map((p) => [p.type, p.value])
+  );
+  return `${parts.year}-${parts.month}-${parts.day} ${parts.hour}:${parts.minute}:${parts.second} ${timeZone}`;
+}
+
 /** ISO date-time (UTC, seconds) of a FortiCloud date. */
 export function stamp(value: unknown): string | undefined {
   const ms = parseDate(value);

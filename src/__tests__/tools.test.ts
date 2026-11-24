@@ -39,7 +39,7 @@ function fgtRoutes(extra: Record<string, any> = {}) {
 }
 
 describe('tool list', () => {
-  it('has the twelve read-only tools, all forticloud_', () => {
+  it('has the fourteen read-only tools, all forticloud_', () => {
     expect(READ_TOOL_NAMES).toEqual([
       'forticloud_status',
       'forticloud_list_accounts',
@@ -53,6 +53,8 @@ describe('tool list', () => {
       'forticloud_list_expiring',
       'forticloud_list_contracts',
       'forticloud_list_folders',
+      'forticloud_get_network',
+      'forticloud_find_ip',
     ]);
     for (const t of ALL_TOOLS) {
       expect(t.annotations?.readOnlyHint).toBe(true);
