@@ -1,6 +1,6 @@
 # FortiCloud MCP server
 
-A read-only MCP server for [Fortinet FortiCloud](https://support.fortinet.com). Claude can ask which FortiGates are offline in FortiGate Cloud, what firmware they run, how their config backups are set, and, from Asset Management, which support and FortiGuard entitlements expire soon.
+A read-only MCP server for [Fortinet FortiCloud](https://support.fortinet.com). Claude can ask which FortiGates are offline in FortiGate Cloud, what firmware they run, how their config backups are set, what a FortiGate's interfaces, DHCP, routes, VIPs and VPNs look like, which client an IP address belongs to, and, from Asset Management, which support and FortiGuard entitlements expire soon.
 
 It uses the same framework as Cititec's other MCP servers: TypeScript, `@modelcontextprotocol/sdk`, a stdio transport, vitest tests, tsup and a Docker image.
 
@@ -11,12 +11,13 @@ One FortiCloud **IAM API user** reaches two portals, each with its own OAuth tok
 | Portal | API | Token `client_id` |
 |---|---|---|
 | **FortiGate Cloud** (being renamed FortiManagement Cloud) | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/...` (`/devices`, `/devices/{sn}`, `/devices/{sn}/configbackups/setting`, `/subaccounts`) | `fortigatecloud` |
+| **FortiOS on each FortiGate**, through FortiGate Cloud | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/fgt/{sn}/api/v2/...` (a fixed list of FortiOS `cmdb` and `monitor` reads; see "Network tools") | `fortigatecloud` |
 | **Asset Management** v3 | `POST https://support.fortinet.com/ES/api/registration/v3/...` with a JSON query (`products/list`, `products/details`, `contracts/list`, `folders/list`) | `assetmanagement` |
 
 - **Tokens:** `POST https://customerapiauth.fortinet.com/api/v1/oauth/token/` (the trailing slash matters) with `{username: <API ID>, password, client_id, grant_type: "password"}`. The token is cached for its `expires_in` less two minutes. A token that FortiCloud rejects early (HTTP 401) is replaced once.
 - **Failed sign-ins:** FortiCloud answers bad credentials with HTTP 400 `invalid_grant`. Repeated failures are reported to lock the API user out of every portal for 15 to 30 minutes, so after a refusal this server does not try to sign in again for 10 minutes.
 - **Regions:** FortiGate Cloud has Global (which is also Canada), US, Europe and Japan hosts (`api.`, `usapi.`, `euapi.`, `jpapi.fortigate.forticloud.com`). The API only shows the region you call. The token and Asset Management hosts are global.
-- **Read-only:** every Asset Management call this server can make is one of its read endpoints (a fixed list in `src/client.ts`), and FortiGate Cloud is only called with GET. The other Asset Management v3 endpoints (register, decommission, transfer, folders/create...) are not reachable. Give the API user a **read-only** permission profile anyway.
+- **Read-only:** every Asset Management call this server can make is one of its read endpoints (a fixed list in `src/client.ts`), and FortiGate Cloud is only called with GET. The FortiOS proxy is called only with GET and only for the endpoints named in `src/fortios.ts`; no tool takes a path. The other Asset Management v3 endpoints (register, decommission, transfer, folders/create...) are not reachable. Give the API user a **read-only** permission profile anyway.
 
 ### What is not confirmed yet
 
@@ -27,6 +28,7 @@ Fortinet's full API reference (FNDN) needs a login. The endpoints and fields abo
 - a "last seen" time on a device: the public sample has none, so `lastSeen` is filled from any of several likely field names, and `forticloud_get_device` shows every other field the API returns (`otherFields`);
 - a list of config backup revisions: only the automatic backup settings (`configbackups/setting`) are documented;
 - `/subaccounts` (account names), Asset Management's page size (25) and `totalPages`, and the fields `folderPath` and `status` on list items;
+- the FortiOS paths other than `cmdb/system/interface` and `monitor/system/interface` (confirmed through the proxy): they follow the FortiOS 7.0-7.6 REST API reference, as do `include_vlan` and `include_aggregate` on `monitor/system/interface`;
 - the bodies of 429 answers. The documented quotas: Asset Management **100 calls a minute, 1,000 an hour and 10 errors an hour**; FortiGate Cloud reportedly 100 calls a second and 15 errors a minute.
 
 Every endpoint and `client_id` is a setting, so a change on Fortinet's side needs no new image.
@@ -64,8 +66,37 @@ All URLs must be https.
 | `forticloud_list_expiring` | Entitlements that end within N days (and, if asked, ended in the last N days), soonest first. Only the latest entitlement of each type per product counts, so a renewed service is not listed. |
 | `forticloud_list_contracts` | Contracts with SKU, status, terms and end date. |
 | `forticloud_list_folders` | Asset Management folders (often one per client). |
+| `forticloud_get_network` | One FortiGate's network, read from the device through FortiGate Cloud: interfaces, DHCP servers, routes, VIPs, IPsec VPNs and (when asked) address objects. See "Network tools". |
+| `forticloud_find_ip` | Which client (sub-account), FortiGate, interface and VLAN an IPv4 address or subnet belongs to, across the online FortiGates. |
+
+14 tools, all read-only.
 
 Lists return `total`, `count`, `offset` and `nextOffset` (Asset Management lists: `totalPages` and `nextPage`), and each response is capped at 60,000 characters. The device list is read once a minute at most and shared by the tools in one session. When FortiGate Cloud does not return the whole device list (paging stops before its advertised total), every result built on it (status, accounts, devices, firmware, config backups, search) carries `complete: false` and a `warning`, so a partial inventory is never presented as the whole fleet.
+
+### Network tools
+
+FortiGate Cloud proxies the FortiOS REST API of the devices it manages: `GET {FORTICLOUD_FGT_URL}/fgt/{serial}/api/v2/...` with the same `fortigatecloud` token. It works whether or not the device is managed from FortiGate Cloud, but the device must be online (its tunnel to FortiGate Cloud up). FortiOS 7 answers can be gzipped; the client unzips them (by `Content-Encoding` or the gzip magic bytes) with the same size cap as any answer.
+
+The proxy helper (`fortiosRequest` in `src/client.ts`) is GET only and takes an endpoint **name**, never a path; a VDOM may be passed (`vdom`). Every field not on that endpoint's **allowlist** (`src/fortios.ts`) is dropped before anything leaves the client, nested lists included. There is no denylist: a FortiOS answer carries secrets on some objects (PPPoE passwords, 802.1X/EAP keys, IPsec pre-shared keys, certificates), and a field FortiOS adds later is dropped too. A test checks that no allowlisted name looks like a secret. Results are still wrapped as untrusted data (interface descriptions, aliases and comments are set on the device), and at most 6 FortiOS reads run at once.
+
+| Section | Endpoints | Kept |
+|---|---|---|
+| `interfaces` | `cmdb/system/interface` + `monitor/system/interface` | name, alias, type, VLAN ID and parent, role, mode, configured and live IP in CIDR, secondary IPs, link, speed, MAC, members, allowaccess, description. `wan: true` for role wan; `publicIp: true` for an address outside RFC 1918, CGNAT (100.64/10), loopback and link-local. Interfaces with no address (except WAN ones) are hidden unless `all_interfaces`. |
+| `dhcp` | `cmdb/system.dhcp/server` (+ `monitor/system/dhcp` for a lease count) | interface, ranges, netmask, gateway, DNS, domain, lease time, active leases. No reserved addresses, MACs, host names or custom options. |
+| `routes` | `monitor/router/ipv4` (falls back to `cmdb/router/static`) | destination, gateway, interface, type, distance, metric, priority; default routes first and on their own. |
+| `vips` | `cmdb/firewall/vip` | name, external IP, interface and port, mapped IP and port, protocol, comment. |
+| `vpn` | `monitor/vpn/ipsec` + `cmdb/vpn.ipsec/phase1-interface` + `phase2-interface` | tunnel name, type, interface, remote gateway, IKE version, up/down, phase 2 local and remote subnets. Never pre-shared keys, certificates or credentials. |
+| `addresses` (only when asked) | `cmdb/firewall/address` | subnet and range objects (other types counted). |
+
+Defaults are every section but `addresses`, with up to `max_rows` (50) rows each. Each section names its source (live or configured), and the result has the device's name, account, FortiOS version and the time it was read (in `FORTICLOUD_TIME_ZONE`). If the first section's reads fail outright (not a 404), the other sections are not tried, because FortiGate Cloud allows few errors a minute.
+
+`forticloud_find_ip` reads the configured and live interface addresses of every FortiGate that is **online** in FortiGate Cloud (or of one `account`), and matches interfaces whose subnet contains the address, or overlaps the subnet given; exact interface addresses come first. Its bounds:
+
+- 4 devices at a time (2 reads each, under the client's cap of 6 reads in flight), each read timing out after 20 s;
+- a 45 s budget for the whole call: when it runs out the call returns what it has, with `complete: false` and the devices it did not reach;
+- each device's interface list is cached for 10 minutes, so calling again continues quickly;
+- after 6 failed devices it stops asking; a 429 stops it with the usual `rate_limited` error;
+- offline devices are not queried, and are listed.
 
 ### Dates and days left
 

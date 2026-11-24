@@ -67,12 +67,12 @@ const MAX_ASSET_PAGES = 12;
  * structured rate_limited error with the wait. Every catch in these tools goes
  * through this or rethrowRateLimit.
  */
-function partError(err: unknown): string {
+export function partError(err: unknown): string {
   rethrowRateLimit(err);
   return clean((err as Error).message, 300) ?? 'failed';
 }
 
-function rethrowRateLimit(err: unknown): void {
+export function rethrowRateLimit(err: unknown): void {
   if (err instanceof ForticloudRateLimitError) throw err;
 }
 
@@ -88,12 +88,12 @@ export function completeness(complete: boolean): { complete?: false; warning?: s
   return complete ? {} : { complete: false, warning: INCOMPLETE_WARNING };
 }
 
-async function devicesWithAccounts(api: Api) {
+export async function devicesWithAccounts(api: Api) {
   const [{ devices, complete }, accounts] = await Promise.all([allDevices(api), accountNames(api)]);
   return { rows: devices.map((d) => deviceRow(d, accounts ?? undefined)), complete, accounts };
 }
 
-function matchAccount(row: DeviceRow, wanted: string | undefined): boolean {
+export function matchAccount(row: DeviceRow, wanted: string | undefined): boolean {
   if (wanted === undefined) return true;
   if (/^-?\d+$/.test(wanted)) return row.accountId === Number(wanted);
   return has(row.account, wanted);
