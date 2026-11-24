@@ -94,7 +94,8 @@ Defaults are every section but `addresses`, with up to `max_rows` (50) rows each
 
 - 4 devices at a time (2 reads each, under the client's cap of 6 reads in flight), each read timing out after 20 s;
 - a 45 s budget for the whole call: when it runs out the call returns what it has, with `complete: false` and the devices it did not reach;
-- each device's interface list is cached for 10 minutes, so calling again continues quickly;
+- each device's interface list is cached for 10 minutes, so calling again continues quickly; only a full read is cached;
+- a device where one of the two interface reads failed (a DHCP or PPPoE WAN address is only in the live one) is listed in `partlySearchedDevices` with the read that failed, the call is `complete: false`, and the device is read again next call;
 - after 6 failed devices it stops asking; a 429 stops it with the usual `rate_limited` error;
 - offline devices are not queried, and are listed.
 

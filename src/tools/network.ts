@@ -413,17 +413,34 @@ interface IfaceNet {
   source: 'configured' | 'live' | 'configured secondary' | 'configured and live';
 }
 
-const ifaceCache = new Map<string, { at: number; value: Promise<IfaceNet[]> }>();
+/** A device's interface addresses; `missing` names the interface read that failed, when only one of the two answered. */
+interface DeviceNets {
+  nets: IfaceNet[];
+  missing?: { read: string; error: string };
+}
+
+const ifaceCache = new Map<string, { at: number; value: Promise<DeviceNets> }>();
 
 export function clearNetworkCaches(): void {
   ifaceCache.clear();
 }
 
-/** One device's interface addresses (configured, secondary and live), from both interface endpoints. */
-async function deviceNets(api: Api, sn: string): Promise<IfaceNet[]> {
+/**
+ * One device's interface addresses (configured, secondary and live), from both
+ * interface endpoints. When only one answers, the addresses it gave are kept
+ * and `missing` says which read failed: a DHCP or PPPoE WAN address is only in
+ * the live read, so the device was not fully searched.
+ */
+async function deviceNets(api: Api, sn: string): Promise<DeviceNets> {
   const [cfg, live] = await Promise.allSettled([api.fortios(sn, 'interfaceConfig'), api.fortios(sn, 'interfaceLive')]);
   for (const r of [cfg, live]) if (r.status === 'rejected') rethrowRateLimit(r.reason);
   if (cfg.status === 'rejected' && live.status === 'rejected') throw cfg.reason;
+  const missing =
+    cfg.status === 'rejected'
+      ? { read: 'configured addresses (cmdb system/interface)', error: partError(cfg.reason) }
+      : live.status === 'rejected'
+        ? { read: 'live addresses (monitor system/interface)', error: partError(live.reason) }
+        : undefined;
   const meta = new Map<string, Omit<IfaceNet, 'net' | 'source'>>();
   const nets: IfaceNet[] = [];
   const push = (n: Net | undefined, name: string, source: IfaceNet['source']) => {
@@ -456,16 +473,21 @@ async function deviceNets(api: Api, sn: string): Promise<IfaceNet[]> {
     const name = String(l.name ?? '');
     if (name) push(parseFortiosNet(l.ip, l.mask), name, 'live');
   }
-  return nets;
+  return missing ? { nets, missing } : { nets };
 }
 
-function cachedNets(api: Api, sn: string): { value: Promise<IfaceNet[]>; cached: boolean } {
+/** A device's addresses, reused for cacheMs. Only a full read (both endpoints) is cached; a failed or partial one is read again next call. */
+function cachedNets(api: Api, sn: string): { value: Promise<DeviceNets>; cached: boolean } {
   const key = `${api.cacheKey}|${sn}`;
   const hit = ifaceCache.get(key);
   if (hit && Date.now() - hit.at < FIND_IP_LIMITS.cacheMs) return { value: hit.value, cached: true };
   const value = deviceNets(api, sn);
-  ifaceCache.set(key, { at: Date.now(), value });
-  value.catch(() => ifaceCache.delete(key));
+  const entry = { at: Date.now(), value };
+  ifaceCache.set(key, entry);
+  const drop = () => {
+    if (ifaceCache.get(key) === entry) ifaceCache.delete(key);
+  };
+  value.then((r) => r.missing && drop(), drop);
   return { value, cached: false };
 }
 
@@ -488,6 +510,7 @@ async function findIp(args: Raw, api: Api) {
   const deadline = Date.now() + FIND_IP_LIMITS.budgetMs;
   const matches: (Raw & { _order: number; _prefix: number })[] = [];
   const errors: Raw[] = [];
+  const partials: Raw[] = [];
   let searched = 0;
   let fromCache = 0;
   let stopped: 'budget' | 'errors' | undefined;
@@ -508,7 +531,7 @@ async function findIp(args: Raw, api: Api) {
       started.add(d.serial);
       const { value, cached } = cachedNets(api, d.serial);
       try {
-        const nets = await value;
+        const { nets, missing } = await value;
         // A device that answered after the budget ran out is not counted (its answer is cached for the next call).
         if (Date.now() > deadline && !cached) {
           stopped ??= 'budget';
@@ -517,6 +540,7 @@ async function findIp(args: Raw, api: Api) {
         searched++;
         if (cached) fromCache++;
         finished.add(d.serial);
+        if (missing) partials.push(compact({ serial: d.serial, device: d.name, account: d.account, notRead: missing.read, error: missing.error }));
         for (const n of nets) {
           const rel = relate(q, n.net);
           if (!rel) continue;
@@ -576,7 +600,7 @@ async function findIp(args: Raw, api: Api) {
   const limit = int(args.limit)!;
   const skipped = online.filter((d) => !finished.has(d.serial));
   const describe = (d: DeviceRow) => compact({ serial: d.serial, device: d.name, account: d.account });
-  const partial = skipped.length > 0 || errors.length > 0;
+  const partial = skipped.length > 0 || errors.length > 0 || partials.length > 0;
   return compact({
     query: q.host ? cidr({ ip: q.ip, prefix: 32 }).replace(/\/32$/, '') : cidr(q),
     matches: sorted.length,
@@ -586,6 +610,7 @@ async function findIp(args: Raw, api: Api) {
       online: online.length,
       searched,
       fromCache: fromCache || undefined,
+      partlySearched: partials.length || undefined,
       failed: errors.length || undefined,
       skipped: skipped.length || undefined,
       notQueried: notQueried.length || undefined,
@@ -599,6 +624,7 @@ async function findIp(args: Raw, api: Api) {
           ? `${errors.length} devices failed, so no more were asked (FortiGate Cloud allows few errors a minute)`
           : undefined,
     skippedDevices: skipped.length ? skipped.slice(0, 100).map((d) => ({ ...describe(d), reason: started.has(d.serial) ? 'still reading when the budget ran out' : 'not reached' })) : undefined,
+    partlySearchedDevices: partials.length ? [...partials] : undefined,
     failedDevices: errors.length ? [...errors] : undefined,
     notQueriedDevices: notQueried.length
       ? notQueried.slice(0, 100).map((d) => ({ ...describe(d), reason: d.connection === 'offline' ? 'offline in FortiGate Cloud' : 'connection unknown' }))

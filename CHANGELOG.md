@@ -18,7 +18,9 @@ Read-only network tools, through FortiGate Cloud's FortiOS API proxy.
   pre-shared keys, certificates) never appear. At most 6 reads in flight;
   gzipped answers are unzipped.
 - `forticloud_find_ip` reads online devices 4 at a time within a 45 s budget,
-  caches each device for 10 minutes, stops after 6 failed devices, and
+  caches each fully read device for 10 minutes, marks a device whose live or
+  configured interface read failed as partly searched (`complete: false`, not
+  cached), stops after 6 failed devices, and
   returns partial results naming the skipped and offline devices.
 
 ## 1.0.0

@@ -458,6 +458,42 @@ describe('forticloud_find_ip', () => {
     await new Promise((r) => setTimeout(r, 400));
   });
 
+  for (const [label, failing, query, found] of [
+    ['the live read fails: a DHCP WAN address could be missed', 'monitor/system/interface', '198.51.100.40', 'lan'],
+    ['the configured read fails', 'cmdb/system/interface', '198.51.100.40', 'wan1'],
+  ] as const) {
+    it(`a device with one interface read missing is partly searched, not complete, and not cached (${label})`, async () => {
+      let n = 0;
+      let ok = false;
+      const { fn, calls } = fakeForticloud(
+        fleet({ [FOS(SN3, failing)]: () => (n++, ok ? json(envelope(failing.startsWith('cmdb') ? C_CONFIG : C_LIVE)) : json({ message: 'timed out' }, 504)) })
+      );
+      setFetchForTests(fn);
+      const out = dataOf(await call('forticloud_find_ip', { query, account: 'client c' }));
+      expect(out.complete).toBe(false);
+      expect(out.devices).toMatchObject({ searched: 1, partlySearched: 1 });
+      expect(out.partlySearchedDevices).toEqual([
+        expect.objectContaining({
+          serial: SN3,
+          notRead: failing.startsWith('cmdb') ? 'configured addresses (cmdb system/interface)' : 'live addresses (monitor system/interface)',
+          error: expect.stringMatching(/504/),
+        }),
+      ]);
+      // What the other read gave is still used.
+      if (found === 'wan1') expect(out.results).toEqual([expect.objectContaining({ interface: 'wan1', source: 'live', match: 'interface address' })]);
+      else expect(out.results ?? []).toEqual([]);
+      // The partial read is not cached: the next call reads the device again, and is complete once both answer.
+      ok = true;
+      const before = fortiosCalls(calls).length;
+      const again = dataOf(await call('forticloud_find_ip', { query, account: 'client c' }));
+      expect(fortiosCalls(calls).length).toBe(before + 2);
+      expect(n).toBe(2);
+      expect(again.complete).toBeUndefined();
+      expect(again.partlySearchedDevices).toBeUndefined();
+      expect(again.results).toEqual([expect.objectContaining({ interface: 'wan1', match: 'interface address' })]);
+    });
+  }
+
   it('stops asking after too many failed devices', async () => {
     FIND_IP_LIMITS.maxErrors = 1;
     FIND_IP_LIMITS.concurrency = 1;
