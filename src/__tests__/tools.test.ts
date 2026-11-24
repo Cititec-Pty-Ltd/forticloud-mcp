@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import { ConfigError, DEFAULTS, getConfig, parseBaseUrl, runWithConfig, scrub, setFetchForTests } from '../client.js';
 import { ALL_TOOLS, READ_TOOL_NAMES, dispatchToolCall } from '../tools/index.js';
-import { ZONELESS_DATE, assetRow, clearCaches, compareFirmware, day, daysLeft, expireBefore, expiryOf, latestByType, parseDate } from '../tools/format.js';
+import { ZONELESS_DATE, assetRow, bool, clearCaches, compareFirmware, day, daysLeft, expireBefore, expiryOf, latestByType, parseDate } from '../tools/format.js';
 import { wrapUntrusted } from '../tools/shared.js';
 import { ASSET, FGT, dataOf, fakeForticloud, json, textOf } from './test-helpers.js';
 import type { Call } from './test-helpers.js';
@@ -730,6 +730,48 @@ describe('expiry dates and time zones', () => {
         expect(dataOf(await call('forticloud_list_expiring')).entitlements.map((e: any) => e.serial)).toEqual(['FGT60FTK00000002', 'FGT60FTK00000001']);
         expect(dataOf(await call('forticloud_list_contracts')).contracts.map((c: any) => c.contract)).toEqual(['C0000002', 'C0000001']);
       }
+    });
+  });
+
+  describe('flags in string, number and boolean form behave the same', () => {
+    const DECOM = [true, 'true', 'TRUE', 1, '1', 'yes'];
+    const ACTIVE = [false, 'false', 'False', 0, '0', 'no'];
+
+    it('bool() reads every form; anything else is unknown', () => {
+      for (const v of DECOM) expect([v, bool(v)]).toEqual([v, true]);
+      for (const v of ACTIVE) expect([v, bool(v)]).toEqual([v, false]);
+      for (const v of [undefined, null, '', 'maybe', 2, {}]) expect(bool(v)).toBeUndefined();
+    });
+
+    it('list_expiring and list_assets leave decommissioned products out in every form, and include them when asked', async () => {
+      const t = Date.now();
+      const ent = [{ typeDesc: 'Support', endDate: new Date(t + 5 * DAY).toISOString() }];
+      const assets = [
+        ...DECOM.map((v, i) => ({ serialNumber: `FGT60FTK0000010${i}`, isDecommissioned: v, entitlements: ent })),
+        ...ACTIVE.map((v, i) => ({ serialNumber: `FGT60FTK0000020${i}`, isDecommissioned: v, entitlements: ent })),
+      ];
+      setFetchForTests(fakeForticloud({ [`${ASSET}/products/list`]: json({ status: 0, totalPages: 1, assets }) }).fn);
+      const active = ACTIVE.map((_, i) => `FGT60FTK0000020${i}`).sort();
+
+      const expiring = dataOf(await call('forticloud_list_expiring'));
+      expect(expiring.entitlements.map((e: any) => e.serial).sort()).toEqual(active);
+      expect(dataOf(await call('forticloud_list_expiring', { include_decommissioned: true })).total).toBe(assets.length);
+
+      const listed = dataOf(await call('forticloud_list_assets', { pages: 1 }));
+      expect(listed.assets.map((a: any) => a.serial).sort()).toEqual(active);
+      const all = dataOf(await call('forticloud_list_assets', { pages: 1, include_decommissioned: true }));
+      expect(all.assets.filter((a: any) => a.decommissioned === true)).toHaveLength(DECOM.length);
+    });
+
+    it('device connection reads tunnelAlive in every form', async () => {
+      const devices = [
+        ...DECOM.map((v, i) => ({ sn: `FGT60FTK0000030${i}`, tunnelAlive: v })),
+        ...ACTIVE.map((v, i) => ({ sn: `FGT60FTK0000040${i}`, tunnelAlive: v })),
+      ];
+      setFetchForTests(fakeForticloud(fgtRoutes({ [`${FGT}/devices`]: json(devices) })).fn);
+      const out = dataOf(await call('forticloud_list_devices', { connection: 'offline' }));
+      expect(out.matching).toEqual({ online: 0, offline: ACTIVE.length, unknown: 0 });
+      expect(dataOf(await call('forticloud_list_devices', { connection: 'online' })).total).toBe(DECOM.length);
     });
   });
 

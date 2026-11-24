@@ -395,8 +395,9 @@ async function listExpiring(args: Raw, api: Api) {
   const found: { row: Raw & { type?: string }; ms?: number }[] = [];
   const assetsWithExpiry = new Set<string>();
   for (const a of r.assets) {
-    if (a.isDecommissioned === true && !args.include_decommissioned) continue;
+    // Filters read the normalised row (bool() takes true, "true", 1...), never the raw field.
     const asset = assetRow(a, now);
+    if (asset.decommissioned === true && !args.include_decommissioned) continue;
     if (!has(asset.folder, str(args.folder))) continue;
     for (const { row: e, ms } of latestEntitlements(a.entitlements, now)) {
       // The window is in whole days on purpose (days / include_expired_days); ordering uses the exact moment.

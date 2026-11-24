@@ -103,8 +103,21 @@ export function expireBefore(days: number, now = Date.now()): string {
   return `${new Date(now + days * DAY_MS).toISOString().slice(0, 10)}T23:59:59+00:00`;
 }
 
-const bool = (v: unknown): boolean | undefined =>
-  typeof v === 'boolean' ? v : typeof v === 'string' && /^(true|false)$/i.test(v) ? /^true$/i.test(v) : undefined;
+/**
+ * A FortiCloud flag in any of the forms seen: true/false, "true"/"false",
+ * 1/0, "1"/"0", "yes"/"no" (any case). Anything else is unknown. Every flag a
+ * tool shows or filters on goes through this (in assetRow and deviceRow), never
+ * a raw === true.
+ */
+export function bool(v: unknown): boolean | undefined {
+  if (typeof v === 'boolean') return v;
+  if (v === 1 || v === 0) return v === 1;
+  if (typeof v !== 'string') return undefined;
+  const s = v.trim().toLowerCase();
+  if (s === 'true' || s === '1' || s === 'yes') return true;
+  if (s === 'false' || s === '0' || s === 'no') return false;
+  return undefined;
+}
 
 /** A FortiCloud serial number: letters, digits and dashes. Used in paths, so strict. */
 export function checkSerial(value: unknown, key = 'serial'): string {
