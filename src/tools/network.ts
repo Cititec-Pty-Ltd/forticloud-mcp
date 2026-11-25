@@ -24,7 +24,7 @@ const addr = (v: unknown) => {
 };
 
 /** The device's name, account and connection from the (cached) FortiGate Cloud list; just the serial when it cannot be read. */
-async function deviceInfo(api: Api, sn: string): Promise<{ row: Partial<DeviceRow> & { serial: string }; note?: string }> {
+export async function deviceInfo(api: Api, sn: string): Promise<{ row: Partial<DeviceRow> & { serial: string }; note?: string }> {
   try {
     const { rows } = await devicesWithAccounts(api);
     const row = rows.find((r) => r.serial.toUpperCase() === sn);
@@ -79,7 +79,7 @@ async function both(ctx: Ctx, a: FortiosEndpointName, b: FortiosEndpointName) {
  * this in, so a cut answer never reads as complete; its totals and counts then
  * cover only what was read.
  */
-function cutInfo(reads: [label: string, res: FortiosResult | undefined][]) {
+export function cutInfo(reads: [label: string, res: FortiosResult | undefined][]) {
   const cut = reads
     .filter(([, r]) => r && (r.truncated || r.nestedCut))
     .map(([read, r]) =>
@@ -100,7 +100,7 @@ function cutInfo(reads: [label: string, res: FortiosResult | undefined][]) {
 }
 
 /** Says when rows were left out of a section's list by max_rows (or a fixed cap), with the real total. */
-function shownInfo(total: number, shown: number, hint: string) {
+export function shownInfo(total: number, shown: number, hint: string) {
   return shown < total ? { shown, moreRows: `${total - shown} more not shown; ${hint}` } : {};
 }
 
@@ -409,10 +409,16 @@ async function addresses(ctx: Ctx) {
 
 const RUN: Record<Section, (ctx: Ctx) => Promise<unknown>> = { interfaces, dhcp, routes, vips, vpn, addresses };
 
+/** The optional `vdom` argument, checked. */
+export function checkVdom(value: unknown): string | undefined {
+  const vdom = str(value);
+  if (vdom !== undefined && !/^[A-Za-z0-9_.-]{1,31}$/.test(vdom)) throw new InputError('vdom must be a VDOM name (letters, digits, _ . -)');
+  return vdom;
+}
+
 async function getNetwork(args: Raw, api: Api) {
   const sn = checkSerial(args.serial);
-  const vdom = str(args.vdom);
-  if (vdom !== undefined && !/^[A-Za-z0-9_.-]{1,31}$/.test(vdom)) throw new InputError('vdom must be a VDOM name (letters, digits, _ . -)');
+  const vdom = checkVdom(args.vdom);
   const wanted = (args.sections as Section[] | undefined) ?? DEFAULT_SECTIONS;
   const sections = SECTIONS.filter((s) => wanted.includes(s));
   const ctx: Ctx = { api, sn, vdom, maxRows: int(args.max_rows)!, allInterfaces: args.all_interfaces === true, meta: {} };
