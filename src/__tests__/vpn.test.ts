@@ -627,13 +627,42 @@ describe('forticloud_get_vpn: review fixes', () => {
       vpnRoutes(SN, {
         'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
         'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15), route(3, 'to-hq-fibre', 10, '198.51.100.0 255.255.255.0')])),
+      })
+    );
+    setFetchForTests(fn);
+    const line = dataOf(await call({ serial: SN })).summary.sites[0];
+    expect(line).toMatch(/Problems: 198\.51\.100\.0\/24 has a route only via to-hq-fibre: no other tunnel takes over if it goes down\.$/);
+    expect(line).not.toMatch(/should work/);
+  });
+
+  it('route-distance failover: a wider route on the other tunnel covers a narrower one', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
         'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15), route(3, 'to-hq-fibre', 10, '203.0.113.128 255.255.255.128')])),
       })
     );
     setFetchForTests(fn);
     const line = dataOf(await call({ serial: SN })).summary.sites[0];
-    expect(line).toMatch(/Problems: 203\.0\.113\.128\/25 has a route only via to-hq-fibre: no other tunnel takes over if it goes down\.$/);
-    expect(line).not.toMatch(/should work/);
+    expect(line).not.toMatch(/Problems:/);
+    expect(line).toMatch(/should work/);
+  });
+
+  it('a BGP neighbor on a /31 tunnel subnet is matched to its tunnel', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([])),
+        'cmdb/system/interface': json(envelope([{ name: 'to-hq-fibre', type: 'tunnel', ip: '192.0.2.0 255.255.255.254' }])),
+        'cmdb/router/bgp': json(envelope({ as: '65001', 'router-id': '192.0.2.1', neighbor: [{ ip: '192.0.2.1', 'remote-as': '65000' }], 'neighbor-group': [], 'neighbor-range': [] })),
+        'monitor/router/bgp/neighbors': notFound(),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.bgp.neighbors[0]).toMatchObject({ ip: '192.0.2.1', tunnel: 'to-hq-fibre' });
+    expect(out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-fibre').bgpNeighbors).toEqual(['192.0.2.1']);
   });
 
   it('a cut live phase 2 list keeps the tunnel state unknown when a configured selector is missing from it', async () => {

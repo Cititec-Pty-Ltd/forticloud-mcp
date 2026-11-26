@@ -321,7 +321,7 @@ function tunnelFor(n: NeighborRef, tunnels: Set<string>, nets: Map<string, Tunne
   const local = parseIpv4(n.localIp);
   for (const [name, t] of nets) {
     if (ip !== undefined && t.remote && (t.remote.ip === ip || (t.remote.prefix < 32 && contains(t.remote, ip)))) return name;
-    if (ip !== undefined && t.ip && t.ip.prefix < 31 && contains(t.ip, ip) && t.ip.ip !== ip) return name;
+    if (ip !== undefined && t.ip && t.ip.prefix <= 31 && contains(t.ip, ip) && t.ip.ip !== ip) return name;
     if (local !== undefined && t.ip && t.ip.ip === local) return name;
   }
   return undefined;
@@ -475,6 +475,17 @@ const holdText = (t: Tunnel) => {
 
 const liveRoutes = (t: Tunnel | undefined) => (t?.routes ?? []).filter((r) => enabled(r.status));
 
+/** One of these routes covers r: same VRF and the same destination, or a subnet that contains it. */
+function coveredBy(routes: TunnelRoute[], r: TunnelRoute): boolean {
+  const rn = parseFortiosNet(r.destination);
+  return routes.some((x) => {
+    if ((x.vrf ?? 0) !== (r.vrf ?? 0)) return false;
+    if (x.destination === r.destination) return true;
+    const xn = parseFortiosNet(x.destination);
+    return !!rn && !!xn && xn.prefix <= rn.prefix && contains(xn, rn.ip);
+  });
+}
+
 /** Why this tunnel carries traffic (a route, SD-WAN, BGP or routes it adds itself), or undefined. */
 function carries(t: Tunnel): string | undefined {
   if (liveRoutes(t).length) return 'static routes';
@@ -497,12 +508,7 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   if (p && f.routesKnown && f.sdwanKnown && !carries(p)) problems.push(`primary ${p.name} has no route using it`);
   if (p && f.routesKnown && !b.sdwanMember && !b.bgpNeighbors?.length && liveRoutes(b).length) {
     // A backup route covers a primary destination when it is in the same VRF and its subnet contains it.
-    const backupNets = liveRoutes(b).map((r) => ({ vrf: r.vrf ?? 0, dst: r.destination, net: parseFortiosNet(r.destination) }));
-    const covered = (r: TunnelRoute) => {
-      const pn = parseFortiosNet(r.destination);
-      return backupNets.some((x) => x.vrf === (r.vrf ?? 0) && (x.dst === r.destination || (!!pn && !!x.net && x.net.prefix <= pn.prefix && contains(x.net, pn.ip))));
-    };
-    const missing = liveRoutes(p).filter((r) => !covered(r)).map((r) => r.destination);
+    const missing = liveRoutes(p).filter((r) => !coveredBy(liveRoutes(b), r)).map((r) => r.destination);
     if (missing.length) problems.push(`backup ${b.name} has no route to ${[...new Set(missing)].join(', ')}, which the primary carries`);
   }
 
@@ -688,18 +694,20 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
       if (g.every((t) => t.status === 'down')) problems.push(`all of ${label} are down: no tunnel to this site`);
       // Each subnet needs a route over more than one tunnel, or nothing takes over when its tunnel fails.
       if (f.routesKnown) {
-        const via = new Map<string, { dst: string; tunnels: Set<string> }>();
+        const via = new Map<string, { dst: string; route: TunnelRoute; tunnels: Set<string> }>();
         for (const t of g)
           for (const r of liveRoutes(t)) {
             const k = `${r.vrf ?? 0}|${r.destination}`;
-            const e = via.get(k) ?? { dst: r.destination, tunnels: new Set<string>() };
+            const e = via.get(k) ?? { dst: r.destination, route: r, tunnels: new Set<string>() };
             e.tunnels.add(t.name);
             via.set(k, e);
           }
         const only = new Map<string, string[]>();
-        for (const { dst, tunnels } of via.values()) {
+        for (const { dst, route, tunnels } of via.values()) {
           if (tunnels.size !== 1) continue;
           const [t] = [...tunnels];
+          // Another tunnel with a covering route (a wider subnet in the same VRF) takes over too.
+          if (g.some((o) => o.name !== t && coveredBy(liveRoutes(o), route))) continue;
           // BGP over another tunnel of the site may carry a backup route the static routes do not show.
           if (g.some((o) => o.name !== t && o.bgpNeighbors?.length)) continue;
           only.set(t, [...(only.get(t) ?? []), dst]);
