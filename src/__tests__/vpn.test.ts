@@ -952,4 +952,20 @@ describe('forticloud_get_vpn: review fixes', () => {
     const out = dataOf(await call({ serial: SN }));
     expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route to 198\.51\.100\.0\/24/));
   });
+
+  it('route-distance coverage is not judged when BGP neighbors could not all be placed on a tunnel', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15), route(3, 'to-hq-fibre', 10, '198.51.100.0 255.255.255.0')])),
+        'cmdb/system/interface': json({ status: 'error', http_status: 403 }, 403),
+        'cmdb/router/bgp': json(envelope({ as: '65001', 'router-id': '192.0.2.1', neighbor: [{ ip: '192.0.2.4', 'remote-as': '65000' }], 'neighbor-group': [], 'neighbor-range': [] })),
+        'monitor/router/bgp/neighbors': notFound(),
+      })
+    );
+    setFetchForTests(fn);
+    const line = dataOf(await call({ serial: SN })).summary.sites[0];
+    expect(line).not.toMatch(/has a route only via/);
+  });
 });

@@ -718,7 +718,7 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
       const up = g.filter((t) => t.status !== undefined && t.status !== 'down');
       if (g.every((t) => t.status === 'down')) problems.push(`all of ${label} are down: no tunnel to this site`);
       // Each subnet needs a route over more than one tunnel, or nothing takes over when its tunnel fails.
-      if (f.routesKnown) {
+      if (f.routesKnown && f.sdwanKnown && f.bgpKnown) {
         const via = new Map<string, { dst: string; route: TunnelRoute; tunnels: Set<string> }>();
         for (const t of g)
           for (const r of liveRoutes(t)) {
@@ -899,7 +899,7 @@ async function getVpn(args: Raw, api: Api) {
   if (memGot.ok && !facts.sdwanKnown) caveats.push('The SD-WAN member list was cut, so "no route uses this tunnel" is not checked.');
   if (!facts.sdwanKnown && !memGot.ok) caveats.push(`SD-WAN membership could not be read (${memGot.fail.reason}), so "no route uses this tunnel" is not checked.`);
   if ((bgpGot.ok || bgpLiveGot.ok) && !facts.bgpKnown) caveats.push('Not every BGP neighbor could be placed on a tunnel (a BGP list was cut, or the tunnel addresses could not be read in full), so "no route uses this tunnel" is not checked.');
-  if (!bgpGot.ok && !bgpLiveGot.ok) caveats.push(`BGP could not be read (${bgpGot.fail.reason}); a tunnel that carries only BGP routes may be reported with no route.`);
+  if (!bgpGot.ok && !bgpLiveGot.ok && !facts.bgpKnown) caveats.push(`BGP could not be read (${bgpGot.fail.reason}), so "no route uses this tunnel" is not checked.`);
   else if (!ifGot.ok) caveats.push(`The tunnel interface addresses could not be read (${ifGot.fail.reason}), so BGP neighbors are matched to tunnels by interface and update-source only.`);
   if (shownSites.some((s) => s.problems.some((p) => /no route/.test(p))))
     caveats.push('Policy routes are not read; a tunnel used only by a policy route is reported with no route (forticloud_get_routing lists them).');
