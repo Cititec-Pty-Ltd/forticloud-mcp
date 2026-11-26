@@ -478,12 +478,19 @@ const holdText = (t: Tunnel) => {
 const liveRoutes = (t: Tunnel | undefined) => (t?.routes ?? []).filter((r) => enabled(r.status));
 
 /** One of these routes covers r: same VRF and the same destination, or a subnet that contains it. */
+/** A route destination as a network; unlike parseFortiosNet, keeps 0.0.0.0/0 (the default route). */
+function routeNet(dst: string): { ip: number; prefix: number } | undefined {
+  const d = dst.trim();
+  if (d === '0.0.0.0/0' || d === '0.0.0.0 0.0.0.0' || d === '0.0.0.0') return { ip: 0, prefix: 0 };
+  return parseFortiosNet(dst);
+}
+
 function coveredBy(routes: TunnelRoute[], r: TunnelRoute): boolean {
-  const rn = parseFortiosNet(r.destination);
+  const rn = routeNet(r.destination);
   return routes.some((x) => {
     if ((x.vrf ?? 0) !== (r.vrf ?? 0)) return false;
     if (x.destination === r.destination) return true;
-    const xn = parseFortiosNet(x.destination);
+    const xn = routeNet(x.destination);
     return !!rn && !!xn && xn.prefix <= rn.prefix && contains(xn, rn.ip);
   });
 }

@@ -795,4 +795,27 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(pair.healthy).toBeUndefined();
     expect(JSON.stringify(pair)).not.toMatch(/not configured/);
   });
+
+  it('a default route on the backup covers the primary subnets', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, { 'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15, '0.0.0.0 0.0.0.0')])) })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+    expect(out.pairs[0].problems).toBeUndefined();
+  });
+
+  it('route-distance failover: a default route on the other tunnel covers a specific subnet', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-fibre', 10, '0.0.0.0 0.0.0.0'), route(3, 'to-hq-4g', 15, '0.0.0.0 0.0.0.0')])),
+      })
+    );
+    setFetchForTests(fn);
+    const line = dataOf(await call({ serial: SN })).summary.sites[0];
+    expect(line).not.toMatch(/Problems:/);
+  });
 });
