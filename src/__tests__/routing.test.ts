@@ -781,3 +781,57 @@ describe('forticloud_get_routing: review fixes', () => {
     expect(out.policyRoutes.error).toMatch(/answered 404 and this serial is not in the FortiGate Cloud device list/);
   });
 });
+
+describe('forticloud_get_routing: second review fixes', () => {
+  it('a disabled route never takes the installed path; the live priority picks between otherwise equal routes', async () => {
+    const { fn } = fakeForticloud(
+      routingRoutes(SN, {
+        'cmdb/router/static': json(
+          envelope([
+            { 'seq-num': 1, dst: '0.0.0.0 0.0.0.0', gateway: '198.51.100.1', device: 'wan1', distance: 10, priority: 1, status: 'disable' },
+            { 'seq-num': 2, dst: '0.0.0.0 0.0.0.0', gateway: '198.51.100.1', device: 'wan1', distance: 10, priority: 1, status: 'enable' },
+            { 'seq-num': 3, dst: '203.0.113.0 255.255.255.128', gateway: '198.51.100.1', device: 'wan1', distance: 10, priority: 5, status: 'enable' },
+            { 'seq-num': 4, dst: '203.0.113.0 255.255.255.128', gateway: '198.51.100.1', device: 'wan1', distance: 10, priority: 1, status: 'enable' },
+          ])
+        ),
+        'monitor/router/ipv4': json(
+          envelope([
+            liveDefault('wan1', '198.51.100.1', 10, 1),
+            { type: 'static', ip_mask: '203.0.113.0/25', gateway: '198.51.100.1', interface: 'wan1', distance: 10, priority: 1 },
+            { type: 'static', ip_mask: '203.0.113.0/25', gateway: '198.51.100.1', interface: 'wan1', distance: 10, priority: 5 },
+          ])
+        ),
+      })
+    );
+    setFetchForTests(fn);
+    const rc = dataOf(await call({ serial: SN })).routeCandidates.routes;
+    const bySeq = Object.fromEntries(rc.map((r: any) => [r.seq, r]));
+    expect(bySeq[1]).toMatchObject({ state: 'inactive', reason: 'disabled in config', inRoutingTable: false });
+    expect(bySeq[2]).toMatchObject({ state: 'active', inRoutingTable: true });
+    expect(bySeq[4]).toMatchObject({ priority: 1, state: 'active' });
+    expect(bySeq[3]).toMatchObject({ priority: 5, state: 'standby', inRoutingTable: true });
+    expect(rc).toHaveLength(4);
+  });
+
+  it('paths in different VRFs do not compete', async () => {
+    const { fn } = fakeForticloud(
+      routingRoutes(SN, {
+        'cmdb/router/static': json(
+          envelope([
+            { 'seq-num': 1, dst: '0.0.0.0 0.0.0.0', gateway: '198.51.100.1', device: 'wan1', distance: 10, status: 'enable', vrf: 0 },
+            { 'seq-num': 2, dst: '0.0.0.0 0.0.0.0', gateway: '203.0.113.1', device: 'wan2', distance: 20, status: 'enable', vrf: 1 },
+          ])
+        ),
+        'monitor/router/ipv4': json(envelope([{ ...liveDefault('wan1', '198.51.100.1', 10, 0), vrf: 0 }, { ...liveDefault('wan2', '203.0.113.1', 20, 0), vrf: 1 }])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.routeCandidates.routes.map((r: any) => [r.interface, r.vrf, r.state])).toEqual([
+      ['wan1', undefined, 'active'],
+      ['wan2', 1, 'active'],
+    ]);
+    expect(out.summary.paths).toBeUndefined();
+    expect(out.summary.activeDefaultRoute).toBe('wan1 via 198.51.100.1 (distance 10, priority 0); VRF 1: wan2 via 203.0.113.1 (distance 20, priority 0)');
+  });
+});

@@ -445,6 +445,8 @@ export interface Candidate {
   /** link-monitor-exempt: no link-monitor removes this route. */
   linkMonitorExempt?: true;
   sdwanZone?: string;
+  /** The VRF (routing table) the path is in; 0 when not given. Paths only compete within one VRF. */
+  vrf?: number;
   liveType?: string;
   monitoredBy?: string[];
   inRoutingTable?: boolean;
@@ -455,6 +457,7 @@ export interface Candidate {
 type CandidateState = Pick<Candidate, 'state' | 'reason'>;
 
 interface LiveRoute {
+  vrf?: number;
   destination?: string;
   gateway?: string;
   interface?: string;
@@ -481,7 +484,15 @@ function destKey(d: string): [number, number, string] {
 function byDestination(a: Candidate, b: Candidate) {
   const [an, al, as] = destKey(a.destination);
   const [bn, bl, bs] = destKey(b.destination);
-  return an - bn || al - bl || as.localeCompare(bs) || rank(a)[0] - rank(b)[0] || rank(a)[1] - rank(b)[1];
+  return an - bn || al - bl || as.localeCompare(bs) || (a.vrf ?? 0) - (b.vrf ?? 0) || rank(a)[0] - rank(b)[0] || rank(a)[1] - rank(b)[1];
+}
+
+/** Paths compete only within one routing table: grouped by VRF and destination. */
+const scopeKey = (c: { vrf?: number; destination?: string }) => `${c.vrf ?? 0}|${c.destination}`;
+function byScope(cands: Candidate[]): Map<string, Candidate[]> {
+  const out = new Map<string, Candidate[]>();
+  for (const c of cands) out.set(scopeKey(c), [...(out.get(scopeKey(c)) ?? []), c]);
+  return out;
 }
 
 export interface Signals {
@@ -524,7 +535,7 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
   const cands: Candidate[] = [];
   for (const s of statics ?? []) {
     const destination = s.destinationAddress ?? s.destination;
-    const base = { destination, seq: s.seq, configured: true, status: s.status, distance: s.distance };
+    const base = { destination, seq: s.seq, configured: true, status: s.status, distance: s.distance, vrf: s.vrf };
     if (s.viaSdwan) {
       const members = (sdwan?.members ?? []).filter((m) => !s.sdwanZones || !m.zone || s.sdwanZones.includes(m.zone));
       if (members.length) {
@@ -570,14 +581,18 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
   const matched = new Set<Candidate>();
   for (const l of live) {
     if (!l.destination) continue;
-    const hit = cands.find(
-      (c) =>
-        !matched.has(c) &&
-        c.destination === l.destination &&
-        (c.interface === l.interface || (c.blackhole && isNull(l.interface))) &&
-        (!c.gateway || !l.gateway || c.gateway === l.gateway) &&
-        (c.distance === undefined || l.distance === undefined || c.distance === l.distance)
-    );
+    // A disabled route is never installed; the same VRF, and the priority when both have one, break ties.
+    const fits = (c: Candidate) =>
+      !matched.has(c) &&
+      enabled(c.status) &&
+      scopeKey(c) === scopeKey(l) &&
+      (c.interface === l.interface || (c.blackhole && isNull(l.interface))) &&
+      (!c.gateway || !l.gateway || c.gateway === l.gateway) &&
+      (c.distance === undefined || l.distance === undefined || c.distance === l.distance);
+    const hit =
+      cands.find((c) => fits(c) && c.priority !== undefined && l.priority !== undefined && c.priority === l.priority) ??
+      cands.find((c) => fits(c) && (c.priority === undefined || l.priority === undefined || c.priority === l.priority)) ??
+      cands.find(fits);
     if (hit) {
       matched.add(hit);
       hit.inRoutingTable = true;
@@ -585,6 +600,7 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
       continue;
     }
     const c = compact({
+      vrf: l.vrf || undefined,
       destination: l.destination,
       gateway: l.gateway,
       interface: l.interface,
@@ -599,10 +615,8 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
     cands.push(c);
   }
 
-  // States, one destination at a time.
-  const byDest = new Map<string, Candidate[]>();
-  for (const c of cands) byDest.set(c.destination, [...(byDest.get(c.destination) ?? []), c]);
-  for (const group of byDest.values()) {
+  // States, one destination (in one VRF) at a time.
+  for (const group of byScope(cands).values()) {
     const installed = group.filter((c) => c.inRoutingTable);
     const best = installed.reduce<Candidate | undefined>((b, c) => (!b || better(c, b) ? c : b), undefined);
     const winners = installed.filter((c) => best && sameRank(c, best));
@@ -627,10 +641,10 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
 
 /** "Internet (0.0.0.0/0): wan2 active (distance 1); wan1 (distance 1) is down: ...; backup wan1 via 192.0.2.9 at distance 5." */
 export function describePaths(cands: Candidate[], max = 30): { paths: string[]; more?: number } {
-  const byDest = new Map<string, Candidate[]>();
-  for (const c of cands) byDest.set(c.destination, [...(byDest.get(c.destination) ?? []), c]);
   const out: string[] = [];
-  for (const [dest, group] of byDest) {
+  for (const group of byScope(cands).values()) {
+    const dest = group[0].destination;
+    const vrf = group[0].vrf ?? 0;
     // Only destinations with a choice of path, or a path that is not in use.
     if (group.length < 2 && group.every((c) => c.state === 'active' || c.state === undefined)) continue;
     if (group.every((c) => c.source === 'connected')) continue;
@@ -638,7 +652,7 @@ export function describePaths(cands: Candidate[], max = 30): { paths: string[]; 
     const name = (c: Candidate) => `${c.interface ?? '?'}${c.gateway && dupIface(c) ? ` via ${c.gateway}` : ''}`;
     const at = (c: Candidate) => `distance ${c.distance ?? '?'}${group.some((x) => x !== c && x.distance === c.distance && x.priority !== c.priority) ? `, priority ${c.priority ?? 0}` : ''}`;
     const active = group.filter((c) => c.state === 'active');
-    const label = dest === '0.0.0.0/0' ? 'Internet (0.0.0.0/0)' : dest;
+    const label = `${vrf ? `VRF ${vrf} ` : ''}${dest === '0.0.0.0/0' ? 'Internet (0.0.0.0/0)' : dest}`;
     if (group.every((c) => c.state === undefined)) {
       out.push(`${label}: ${group.map((c) => `${name(c)} (${at(c)})`).join('; ')}; which is in use is not known (the live routing table was not read).`);
       continue;
@@ -659,7 +673,7 @@ export function describePaths(cands: Candidate[], max = 30): { paths: string[]; 
 
 export type Failover = 'sdwan' | 'static-routes-with-link-monitor' | 'static-routes-distance-priority' | 'unknown';
 
-const pathText = (c: Candidate) => `${c.interface ?? '?'}${c.gateway ? ` via ${c.gateway}` : ''} (distance ${c.distance ?? '?'}, priority ${c.priority ?? '?'})`;
+const pathText = (c: Candidate) => `${c.vrf ? `VRF ${c.vrf}: ` : ''}${c.interface ?? '?'}${c.gateway ? ` via ${c.gateway}` : ''} (distance ${c.distance ?? '?'}, priority ${c.priority ?? '?'})`;
 const routeText = (r: StaticRoute) =>
   `${r.viaSdwan ? `SD-WAN${r.sdwanZones ? ` zone ${r.sdwanZones.join(', ')}` : ''}` : (r.interface ?? '?')}${r.gateway ? ` via ${r.gateway}` : ''}` +
   ` (distance ${r.distance ?? '?'}, priority ${r.priority ?? '?'})`;
@@ -840,7 +854,7 @@ async function getRouting(args: Raw, api: Api) {
     sdwanDown.set(iface, [...(sdwanDown.get(iface) ?? []), name]);
   }
   const liveRoutes = liveGot.ok
-    ? liveGot.res.rows.map((r) => compact({ destination: subnetText(r.ip_mask), gateway: addr(r.gateway), interface: text(r.interface, 60), distance: num(r.distance), priority: num(r.priority), type: text(r.type, 20) }) as LiveRoute)
+    ? liveGot.res.rows.map((r) => compact({ vrf: num(r.vrf), destination: subnetText(r.ip_mask), gateway: addr(r.gateway), interface: text(r.interface, 60), distance: num(r.distance), priority: num(r.priority), type: text(r.type, 20) }) as LiveRoute)
     : undefined;
   const candidates = buildCandidates({ statics, sdwan: sd.sdwan, live: liveRoutes, signals: { monitors, links, tunnels, sdwanDown } });
 

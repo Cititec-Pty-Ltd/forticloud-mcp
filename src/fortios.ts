@@ -191,6 +191,7 @@ export const FORTIOS_ENDPOINTS = {
       metric: true,
       priority: true,
       is_tunnel_route: true,
+      vrf: true,
       install_date: true,
     },
   },
