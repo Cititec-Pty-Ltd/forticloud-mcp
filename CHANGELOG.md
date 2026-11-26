@@ -4,6 +4,14 @@ Releases are cut by semantic-release from the commit messages on `main` (the
 "Cititec release" workflow); it adds an entry above this line for each release
 and publishes the image to `ghcr.io/cititec-pty-ltd/forticloud-mcp`.
 
+## 1.3.1
+
+- `forticloud_get_vpn`: a backup tunnel with BGP neighbors no longer skips the
+  phase 2 selector check. Its selectors must still cover the primary's routed
+  traffic, or the pair is not called healthy. Only the static route check is
+  skipped for it, since BGP can bring those routes. Parameters and output
+  fields are unchanged.
+
 ## 1.3.0
 
 A read-only VPN tool, so a tech can tell whether a FortiGate's IPsec VPN
