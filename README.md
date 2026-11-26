@@ -1,6 +1,6 @@
 # FortiCloud MCP server
 
-A read-only MCP server for [Fortinet FortiCloud](https://support.fortinet.com). Claude can ask which FortiGates are offline in FortiGate Cloud, what firmware they run, how their config backups are set, what a FortiGate's interfaces, DHCP, routes, VIPs and VPNs look like, how it fails over between WANs (SD-WAN, static routes with link-monitor, or distance and priority alone), which client an IP address belongs to, and, from Asset Management, which support and FortiGuard entitlements expire soon.
+A read-only MCP server for [Fortinet FortiCloud](https://support.fortinet.com). Claude can ask which FortiGates are offline in FortiGate Cloud, what firmware they run, how their config backups are set, what a FortiGate's interfaces, DHCP, routes, VIPs and VPNs look like, how it fails over between WANs (SD-WAN, static routes with link-monitor, or distance and priority alone), whether its IPsec VPN failover is set up right and would take over, which client an IP address belongs to, and, from Asset Management, which support and FortiGuard entitlements expire soon.
 
 It uses the same framework as Cititec's other MCP servers: TypeScript, `@modelcontextprotocol/sdk`, a stdio transport, vitest tests, tsup and a Docker image.
 
@@ -11,7 +11,7 @@ One FortiCloud **IAM API user** reaches two portals, each with its own OAuth tok
 | Portal | API | Token `client_id` |
 |---|---|---|
 | **FortiGate Cloud** (being renamed FortiManagement Cloud) | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/...` (`/devices`, `/devices/{sn}`, `/devices/{sn}/configbackups/setting`, `/subaccounts`) | `fortigatecloud` |
-| **FortiOS on each FortiGate**, through FortiGate Cloud | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/fgt/{sn}/api/v2/...` (a fixed list of FortiOS `cmdb` and `monitor` reads; see "Network tools" and "Routing tool") | `fortigatecloud` |
+| **FortiOS on each FortiGate**, through FortiGate Cloud | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/fgt/{sn}/api/v2/...` (a fixed list of FortiOS `cmdb` and `monitor` reads; see "Network tools", "Routing tool" and "VPN tool") | `fortigatecloud` |
 | **Asset Management** v3 | `POST https://support.fortinet.com/ES/api/registration/v3/...` with a JSON query (`products/list`, `products/details`, `contracts/list`, `folders/list`) | `assetmanagement` |
 
 - **Tokens:** `POST https://customerapiauth.fortinet.com/api/v1/oauth/token/` (the trailing slash matters) with `{username: <API ID>, password, client_id, grant_type: "password"}`. The token is cached for its `expires_in` less two minutes. A token that FortiCloud rejects early (HTTP 401) is replaced once.
@@ -28,7 +28,7 @@ Fortinet's full API reference (FNDN) needs a login. The endpoints and fields abo
 - a "last seen" time on a device: the public sample has none, so `lastSeen` is filled from any of several likely field names, and `forticloud_get_device` shows every other field the API returns (`otherFields`);
 - a list of config backup revisions: only the automatic backup settings (`configbackups/setting`) are documented;
 - `/subaccounts` (account names), Asset Management's page size (25) and `totalPages`, and the fields `folderPath` and `status` on list items;
-- the FortiOS paths other than `cmdb/system/interface` and `monitor/system/interface` (confirmed through the proxy): they follow the FortiOS 7.0-7.6 REST API reference, as do `include_vlan` and `include_aggregate` on `monitor/system/interface`. The routing reads also need a live check: the answer shapes of `monitor/system/link-monitor` and `monitor/virtual-wan/health-check` (taken as name, then interface, then the counters, and read either way), `monitor/virtual-wan/members` (6.4 and later) and `cmdb/system/virtual-wan-link` on 6.2;
+- the FortiOS paths other than `cmdb/system/interface` and `monitor/system/interface` (confirmed through the proxy): they follow the FortiOS 7.0-7.6 REST API reference, as do `include_vlan` and `include_aggregate` on `monitor/system/interface`. The routing reads also need a live check: the answer shapes of `monitor/system/link-monitor` and `monitor/virtual-wan/health-check` (taken as name, then interface, then the counters, and read either way), `monitor/virtual-wan/members` (6.4 and later) and `cmdb/system/virtual-wan-link` on 6.2. The VPN reads too: the phase 2 selector field names on `monitor/vpn/ipsec` (`proxy_src`/`proxy_dst` in the reference, `proxysrc`/`proxydst` as `forticloud_get_network` reads them; `forticloud_get_vpn` keeps both), what `creation_time` counts, the `monitor` field of `phase1-interface` (a name on 6.4, a list on 7.x; read either way), `status` on `cmdb/vpn.ssl/settings` (7.4 and later), and any uptime or prefix count on `monitor/router/bgp/neighbors` (not in the reference);
 - the bodies of 429 answers. The documented quotas: Asset Management **100 calls a minute, 1,000 an hour and 10 errors an hour**; FortiGate Cloud reportedly 100 calls a second and 15 errors a minute.
 
 Every endpoint and `client_id` is a setting, so a change on Fortinet's side needs no new image.
@@ -68,9 +68,10 @@ All URLs must be https.
 | `forticloud_list_folders` | Asset Management folders (often one per client). |
 | `forticloud_get_network` | One FortiGate's network, read from the device through FortiGate Cloud: interfaces, DHCP servers, routes, VIPs, IPsec VPNs and (when asked) address objects. See "Network tools". |
 | `forticloud_find_ip` | Which client (sub-account), FortiGate, interface and VLAN an IPv4 address or subnet belongs to, across the online FortiGates. |
+| `forticloud_get_vpn` | Whether one FortiGate's IPsec VPN failover is set up right and would take over: per tunnel the phase 1 failover settings (backup of which primary, hold-down, DPD, idle timeout, auto-negotiate, ADVPN), phase 2 selectors, live state (up, partially up, down), and the static routes and BGP neighbors over it; the primary/backup pairs with their problems; one line per remote site; SSL-VPN on or off and users connected. See "VPN tool". |
 | `forticloud_get_routing` | How one FortiGate routes and fails over between WANs: static and policy routes, link monitors and SD-WAN (configured and live), every path per destination with its state (like `get router info routing-table database`), and a summary of the failover method and of which path is in use. See "Routing tool". |
 
-15 tools, all read-only.
+16 tools, all read-only.
 
 Lists return `total`, `count`, `offset` and `nextOffset` (Asset Management lists: `totalPages` and `nextPage`), and each response is capped at 60,000 characters. The device list is read once a minute at most and shared by the tools in one session. When FortiGate Cloud does not return the whole device list (paging stops before its advertised total), every result built on it (status, accounts, devices, firmware, config backups, search) carries `complete: false` and a `warning`, so a partial inventory is never presented as the whole fleet.
 
@@ -128,6 +129,29 @@ FortiOS's REST API has no documented read of the routing-table database (`monito
 
 Every read reports on its own. A part that could not be read says which read and why (`reason`: `not_supported` for a 404, `permission_denied` for a 401 or 403, `rate_limited` with `retryAfterSeconds`, `failed`, or `not_tried`), and the others still show. The top of the result lists them in `unreadable`, names cut answers in `truncatedReads` (each part has the `truncated` details too, as in `forticloud_get_network`) and says `complete: false`. After a 429 no further read is started and `rateLimited` gives the wait; when nothing at all could be read, the tool returns the usual `rate_limited` error. The reads use the `fortigatecloud` token like the network tools and need nothing more of the API user; a FortiGate that refuses one table answers 403, reported as `permission_denied` for that part only.
 
+### VPN tool
+
+`forticloud_get_vpn` takes a `serial`, an optional `vdom`, an optional `tunnel` (a phase 1 name: only that tunnel and the other tunnels to the same site) and `max_rows` (default 50, at most 500 tunnels listed). It makes 10 FortiOS reads: the phase 1 interfaces first and alone (if the device does not answer, nothing else is tried), then the rest at once.
+
+| Part | Endpoints | Kept |
+|---|---|---|
+| `tunnels` | `cmdb/vpn.ipsec/phase1-interface` + `cmdb/vpn.ipsec/phase2-interface` + `monitor/vpn/ipsec`, with `cmdb/router/static` for the routes and `monitor/virtual-wan/members` for SD-WAN membership | Phase 1: interface, remote gateway (or DDNS name), type, IKE version, mode-cfg, `monitor` (as `backupOf`: this tunnel is the backup of that primary), monitor-min, monitor hold-down type, delay and time, DPD mode, retry count and interval, idle timeout, auto-negotiate, NAT keepalive, net-device, add-route (with its distance and priority), exchange-interface-ip, ADVPN sender, receiver, forwarder and shortcuts, comment. Phase 2: local and remote selectors, auto-negotiate, keepalive; live state, live selectors, bytes in and out, seconds to rekey. Live: `up` (every phase 2 up), `partially up` (some; a configured selector the live read does not list counts as not negotiated) or `down`, remote gateway, bytes in and out, `creationTime` as FortiOS gives it; a dial-up server counts its connected peers. The static routes whose interface is the tunnel (destination, gateway, distance, priority, status), the BGP neighbors over it, and `sdwanMember`. **Never** `psksecret`, `psksecret-remote`, `auto-discovery-psk`, certificates, PPKs, peer IDs, XAUTH or EAP users and passwords, or dial-up user names. |
+| `pairs` | from `tunnels` | One per phase 1 `monitor`: primary, backup, `backupOnlyWhenPrimaryDown`, the hold-down in words, both states, `state` (`primary up, backup idle` is the healthy one; `failed over`, `both down`, `both up`), `healthy` and `problems`: both down, the backup up while the primary is up (expected only during a delay or time hold-down), DPD off on the primary (failover slow or never), the primary only partly up (the backup stays idle), no route using the backup (it comes up but carries no traffic), a subnet the primary carries and the backup does not. |
+| `bgp` | `cmdb/router/bgp` + `monitor/router/bgp/neighbors`, with `cmdb/system/interface` for the tunnel addresses | AS, router ID; per neighbor: address, remote AS, interface, update-source, description, shutdown, BFD, live state, admin status, local address (uptime and prefixes received only if the device returns them), and the `tunnel` it runs over (its interface or update-source, or its address in the tunnel interface subnet); neighbor groups and ranges, and live neighbors from a range (ADVPN hubs). No neighbor passwords. A BGP read that answers 404 is `not_supported` and the rest still shows. A tunnel with a BGP neighbor counts as carrying routes. |
+| `sslVpn` | `cmdb/vpn.ssl/settings` + `monitor/vpn/ssl` | On or off (`status` on 7.4 and later, else whether it has a listening interface), port, listening interfaces, users connected (a count only: no user names, addresses or times are kept). No server certificate. |
+| `summary` | all of the above | A count line; `sites`, one plain line per remote site (problems first, at most 30); caveats. |
+
+Tunnels are grouped per remote site by their `monitor` setting, by static routes to the same subnet, and (the rest) as SD-WAN members. For example:
+
+```
+to-hq-fibre / to-hq-4g: primary to-hq-fibre up (DPD on-idle 3x20s); backup to-hq-4g idle (monitor of to-hq-fibre, fails back 60 s after the primary returns); routes 203.0.113.0/24 distance 10/15. Failover should work.
+to-dc-fibre / to-dc-4g: primary to-dc-fibre up (DPD on-idle 3x20s); backup to-dc-4g idle (monitor of to-dc-fibre); routes 198.51.100.0/24 distance 10 (only via to-dc-fibre). Problems: backup to-dc-4g has no route using it: it will come up but carry no traffic.
+```
+
+Two tunnels to one subnet without `monitor` are reported as failover by route distance (both stay up; DPD off on either is a problem, because a dead tunnel would keep its routes). SD-WAN member tunnels are flagged and pointed to `forticloud_get_routing`, which has the health checks and SLA state; this tool does not read the SD-WAN settings. Policy routes are not read, so a tunnel used only by a policy route is reported with no route (a caveat says so). Policy-based tunnels (`vpn ipsec phase1`, not `phase1-interface`) are not read.
+
+Reads report on their own exactly as in the routing tool (`unreadable`, `truncatedReads`, `complete: false`, `rateLimited`; after a 429 no further read is started). When the static routes or SD-WAN membership could not be read, "no route" is not claimed; when the live state could not be read, no pair is called healthy.
+
 ### Dates and days left
 
 One rule for every tool:
@@ -142,7 +166,7 @@ A FortiGate's host name and description are set on the device by whoever adminis
 
 ### Rate limits
 
-A 429 (or a 503 with a wait) on a read is retried once when the wait is 10 s or less. Otherwise the tool returns an error that says `Try again in N s.` with `structuredContent: { error_type: "rate_limited", retry_after_seconds: N }` (60 s when FortiCloud gives no wait). Every request this server makes is a read: Asset Management's POSTs are queries. Writes would never be retried, but there are none. The Cititec MCP host also applies its own per-service budget. `forticloud_get_routing` is the one exception to "a 429 stops the call": once it has read something, it stops asking and returns what it has, with the parts it could not read marked `rate_limited` and the wait in `rateLimited.retryAfterSeconds` (see "Routing tool").
+A 429 (or a 503 with a wait) on a read is retried once when the wait is 10 s or less. Otherwise the tool returns an error that says `Try again in N s.` with `structuredContent: { error_type: "rate_limited", retry_after_seconds: N }` (60 s when FortiCloud gives no wait). Every request this server makes is a read: Asset Management's POSTs are queries. Writes would never be retried, but there are none. The Cititec MCP host also applies its own per-service budget. `forticloud_get_routing` and `forticloud_get_vpn` are the exceptions to "a 429 stops the call": once one has read something, it stops asking and returns what it has, with the parts it could not read marked `rate_limited` and the wait in `rateLimited.retryAfterSeconds` (see "Routing tool" and "VPN tool").
 
 ## Development
 

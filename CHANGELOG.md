@@ -4,6 +4,33 @@ Releases are cut by semantic-release from the commit messages on `main` (the
 "Cititec release" workflow); it adds an entry above this line for each release
 and publishes the image to `ghcr.io/cititec-pty-ltd/forticloud-mcp`.
 
+## 1.3.0
+
+A read-only VPN tool, so a tech can tell whether a FortiGate's IPsec VPN
+failover is set up right and would take over.
+
+- 1 new tool (16 in all): `forticloud_get_vpn`, for one FortiGate by serial
+  (and VDOM, and optionally one tunnel and the rest of its site): per IPsec
+  tunnel the phase 1 failover settings (`monitor`, its hold-down, DPD, idle
+  timeout, auto-negotiate, keepalive, net-device, add-route,
+  exchange-interface-ip, ADVPN), the phase 2 selectors, the live state (up,
+  partially up or down, per phase 2, with bytes), the static routes and BGP
+  neighbors over it, and SD-WAN membership. `pairs` checks each
+  primary/backup pair (healthy is primary up and backup idle; problems:
+  both down, backup up while the primary is up, DPD off on the primary, the
+  primary only partly up, no route using the backup, a subnet only the
+  primary carries). `summary.sites` says per remote site whether failover
+  should work. Also BGP neighbors (matched to tunnels) and SSL-VPN on or off
+  with the number of users connected.
+- Each read reports on its own, as in `forticloud_get_routing`: a BGP or
+  SSL-VPN endpoint that answers 404 is `not_supported` and the rest still
+  shows; after a 429 no further read is started.
+- 7 new FortiOS endpoints on the allowlist (phase 1 and phase 2 with the
+  failover fields, live IPsec with byte counters, BGP settings and live
+  neighbors, SSL-VPN settings and a session count). Pre-shared keys, the
+  ADVPN key, certificates, PPKs, peer IDs, XAUTH/EAP credentials, BGP
+  passwords and SSL-VPN user names are never on a list.
+
 ## 1.2.0
 
 A read-only routing tool, so a tech can tell how a dual-WAN FortiGate fails
