@@ -222,13 +222,22 @@ describe('forticloud_get_vpn', () => {
     expect(out.summary.text).toMatch(/1 problem\.$/);
     expect(out.summary.caveats).toEqual([expect.stringMatching(/^Policy routes are not read/)]);
 
-    // A backup with routes to only some of the primary's subnets.
+    // A backup whose /24 covers the primary's /25: no problem.
     const { fn: fn2 } = fakeForticloud(
       vpnRoutes(SN, { 'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-fibre', 10, '203.0.113.128 255.255.255.128'), route(3, 'to-hq-4g', 15)])) })
     );
     setFetchForTests(fn2);
     const out2 = dataOf(await call({ serial: SN }));
-    expect(out2.pairs[0].problems).toEqual(['backup to-hq-4g has no route to 203.0.113.128/25, which the primary carries']);
+    expect(out2.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+    expect(out2.pairs[0].problems).toBeUndefined();
+
+    // A backup with routes to only some of the primary's subnets (a subnet its routes do not cover).
+    const { fn: fn3 } = fakeForticloud(
+      vpnRoutes(SN, { 'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-fibre', 10, '198.51.100.0 255.255.255.0'), route(3, 'to-hq-4g', 15)])) })
+    );
+    setFetchForTests(fn3);
+    const out3 = dataOf(await call({ serial: SN }));
+    expect(out3.pairs[0].problems).toEqual(['backup to-hq-4g has no route to 198.51.100.0/24, which the primary carries']);
   });
 
   it('DPD disabled on the primary: failover is slow or never happens', async () => {
@@ -671,5 +680,56 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(out.truncatedReads).toContain('monitor virtual-wan/members');
     expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route using it/));
     expect(out.summary.caveats).toContainEqual(expect.stringMatching(/SD-WAN member list was cut/));
+  });
+
+  describe('a backup monitoring two primaries', () => {
+    const setup = (min: number | undefined, a: 'up' | 'down', b: 'up' | 'down', lte: 'up' | 'down') => {
+      const two = { monitor: [{ name: 'to-hq-fibre' }, { name: 'to-hq-nbn' }], ...(min === undefined ? {} : { 'monitor-min': min }) };
+      const { fn } = fakeForticloud(
+        vpnRoutes(SN, {
+          'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-nbn'), phase1('to-hq-4g', two)])),
+          'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), phase2('to-hq-nbn'), phase2('to-hq-4g')])),
+          'monitor/vpn/ipsec': json(
+            envelope([
+              liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', a)]),
+              liveTunnel('to-hq-nbn', [sa('to-hq-nbn-p2', b)]),
+              liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', lte)]),
+            ])
+          ),
+          'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-nbn', 10), route(3, 'to-hq-4g', 15)])),
+        })
+      );
+      setFetchForTests(fn);
+    };
+
+    it('monitor-min 0 (all): one primary down, the other up, backup idle is not "both down"', async () => {
+      setup(0, 'down', 'up', 'down');
+      const out = dataOf(await call({ serial: SN }));
+      const fibre = out.pairs.find((p: any) => p.primary === 'to-hq-fibre');
+      expect(fibre).toMatchObject({ state: 'primary down, backup idle', backupState: 'idle' });
+      expect(fibre.problems).toEqual(['primary to-hq-fibre is down; 1 of 2 monitored primaries are still up, so backup to-hq-4g stays idle (it comes up when all 2 monitored primaries are down)']);
+      expect(JSON.stringify(out.pairs)).not.toMatch(/both .* are down|no tunnel to this site/);
+      expect(out.pairs.find((p: any) => p.primary === 'to-hq-nbn')).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+    });
+
+    it('monitor-min 1: one primary down and the backup up is the expected failover, not an unexpected backup', async () => {
+      setup(1, 'down', 'up', 'up');
+      const out = dataOf(await call({ serial: SN }));
+      expect(out.pairs.find((p: any) => p.primary === 'to-hq-nbn')).toMatchObject({ state: 'primary up, backup up (1 of 2 monitored primaries down)', healthy: true });
+      expect(out.pairs.find((p: any) => p.primary === 'to-hq-fibre').problems).toEqual(['primary to-hq-fibre is down: traffic is on the backup']);
+      expect(JSON.stringify(out.pairs)).not.toMatch(/is up while/);
+    });
+
+    it('monitor-min 1: a primary down and the backup down is flagged', async () => {
+      setup(1, 'down', 'up', 'down');
+      const out = dataOf(await call({ serial: SN }));
+      expect(out.pairs[0].problems).toContain('backup to-hq-4g is down although 1 of 2 monitored primaries are down (it comes up when 1 of 2 monitored primaries are down)');
+    });
+
+    it('all primaries up and the backup up is still unexpected', async () => {
+      setup(undefined, 'up', 'up', 'up');
+      const out = dataOf(await call({ serial: SN }));
+      expect(out.pairs[0].problems?.[0]).toMatch(/^backup to-hq-4g is up while only 0 of 2 monitored primaries are down/);
+    });
   });
 });

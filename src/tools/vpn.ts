@@ -496,8 +496,13 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   if (f.routesKnown && f.sdwanKnown && !carries(b)) problems.push(`backup ${b.name} has no route using it: it will come up but carry no traffic`);
   if (p && f.routesKnown && f.sdwanKnown && !carries(p)) problems.push(`primary ${p.name} has no route using it`);
   if (p && f.routesKnown && !b.sdwanMember && !b.bgpNeighbors?.length && liveRoutes(b).length) {
-    const backupDst = new Set(liveRoutes(b).map((r) => `${r.vrf ?? 0}|${r.destination}`));
-    const missing = liveRoutes(p).filter((r) => !backupDst.has(`${r.vrf ?? 0}|${r.destination}`)).map((r) => r.destination);
+    // A backup route covers a primary destination when it is in the same VRF and its subnet contains it.
+    const backupNets = liveRoutes(b).map((r) => ({ vrf: r.vrf ?? 0, dst: r.destination, net: parseFortiosNet(r.destination) }));
+    const covered = (r: TunnelRoute) => {
+      const pn = parseFortiosNet(r.destination);
+      return backupNets.some((x) => x.vrf === (r.vrf ?? 0) && (x.dst === r.destination || (!!pn && !!x.net && x.net.prefix <= pn.prefix && contains(x.net, pn.ip))));
+    };
+    const missing = liveRoutes(p).filter((r) => !covered(r)).map((r) => r.destination);
     if (missing.length) problems.push(`backup ${b.name} has no route to ${[...new Set(missing)].join(', ')}, which the primary carries`);
   }
 
@@ -507,7 +512,40 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
     : 'unknown: the live tunnel state could not be read';
   let healthy: boolean | undefined;
   let backupState = stateWord(b);
-  if (p && p.status && b.status) {
+  // The backup comes up when monitor-min of its monitored primaries are down (0 or unset: all of them).
+  const monitored = (b.backupOf ?? [primaryName]).map((n) => f.byName.get(n));
+  const total = monitored.length;
+  const multi = total > 1;
+  const allKnown = monitored.every((t) => !!t && t.status !== undefined);
+  const downCount = monitored.filter((t) => t?.status === 'down').length;
+  const threshold = b.monitorMin && b.monitorMin > 0 ? Math.min(b.monitorMin, total) : total;
+  const shouldActivate = downCount >= threshold;
+  const activation = `it comes up when ${threshold === total ? (total > 1 ? `all ${total}` : 'the primary') : `${threshold} of ${total}`} monitored ${total > 1 ? 'primaries are' : 'primary is'} down`;
+  if (multi && p && p.status && b.status && allKnown) {
+    const pUp = p.status !== 'down';
+    const bUp = b.status !== 'down';
+    if (!shouldActivate && !bUp) {
+      state = pUp ? 'primary up, backup idle' : 'primary down, backup idle';
+      backupState = 'idle';
+      if (!pUp) problems.push(`primary ${p.name} is down; ${total - downCount} of ${total} monitored primaries are still up, so backup ${b.name} stays idle (${activation})`);
+    } else if (shouldActivate && bUp) {
+      state = pUp ? `primary up, backup up (${downCount} of ${total} monitored primaries down)` : 'failed over: primary down, backup up';
+      if (!pUp) problems.push(`primary ${p.name} is down: traffic is on the backup`);
+    } else if (shouldActivate && !bUp) {
+      state = 'backup down when needed';
+      problems.push(`backup ${b.name} is down although ${downCount} of ${total} monitored primaries are down (${activation})`);
+    } else {
+      state = 'both up';
+      problems.push(`backup ${b.name} is up while only ${downCount} of ${total} monitored primaries are down (${activation})${hold ? `; expected during the hold-down (${hold})` : ''}`);
+    }
+    if (p.status === 'partially up')
+      problems.push(`primary ${p.name} is only partly up (${p.phase2Up} of ${p.phase2Count} phase 2 up): the down selectors have no path unless the backup comes up`);
+    healthy = problems.length === 0;
+  } else if (multi && p && !allKnown) {
+    const names = b.backupOf ?? [primaryName];
+    const unk = names.filter((_, i) => !monitored[i] || monitored[i]!.status === undefined);
+    state = `unknown: the live state of ${unk.join(' and ') || b.name} is not known, so whether ${b.name} should be up is not known`;
+  } else if (p && p.status && b.status) {
     const pUp = p.status !== 'down';
     const bUp = b.status !== 'down';
     if (p.status === 'up' && !bUp) {
