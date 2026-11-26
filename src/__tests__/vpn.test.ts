@@ -376,7 +376,8 @@ describe('forticloud_get_vpn', () => {
     const out2 = dataOf(await call({ serial: SN }));
     expect(out2.bgp).toMatchObject({ read: 'cmdb router/bgp', reason: 'not_supported', liveError: { reason: 'not_supported' } });
     expect(out2.sslVpn).toMatchObject({ reason: 'not_supported' });
-    expect(out2.summary.caveats).toEqual([expect.stringMatching(/^BGP could not be read \(not_supported\)/)]);
+    // BGP is simply not on this FortiOS: nothing was missed, so no caveat.
+    expect(out2.summary.caveats).toBeUndefined();
     expect(out2.summary.sites[0]).toMatch(/Failover should work\.$/);
   });
 
