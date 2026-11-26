@@ -426,7 +426,7 @@ export async function fortiosRequest(
   config: ForticloudConfig,
   serial: string,
   name: FortiosEndpointName,
-  options: { vdom?: string } = {}
+  options: FortiosOptions = {}
 ): Promise<FortiosResult> {
   const endpoint = FORTIOS_ENDPOINTS[name];
   if (!endpoint) throw new Error(`Not a FortiOS read endpoint: ${String(name)}`);
@@ -436,9 +436,16 @@ export async function fortiosRequest(
   const query: Record<string, string> = { ...('query' in endpoint ? endpoint.query : {}) };
   if (options.vdom !== undefined) query.vdom = options.vdom;
   const label = `FortiOS ${endpoint.path}`;
-  const body = await fortiosSlot(() =>
-    portalRequest<unknown>(config, 'fgt', 'GET', `/fgt/${sn}/api/v2/${endpoint.path}`, { query, timeoutMs: FORTIOS_TIMEOUT_MS })
-  );
+  const body = await fortiosSlot(() => {
+    // Checked when the read actually starts, not when it was queued behind the slot limit.
+    const stop = options.cancelled?.();
+    if (stop) throw stop;
+    return portalRequest<unknown>(config, 'fgt', 'GET', `/fgt/${sn}/api/v2/${endpoint.path}`, { query, timeoutMs: FORTIOS_TIMEOUT_MS }).catch((err: unknown) => {
+      // Told while this read still holds its slot, so a read queued behind it already sees the 429.
+      if (err instanceof ForticloudRateLimitError) options.onRateLimited?.(err);
+      throw err;
+    });
+  });
   // FortiOS reports its own errors in the body: {status: "error", http_status: 404, ...}.
   const env = (body && typeof body === 'object' ? body : {}) as Record<string, unknown>;
   const inner = Number(env.http_status);
@@ -451,6 +458,18 @@ export async function fortiosRequest(
   return filterFortios(body, endpoint);
 }
 
+export interface FortiosOptions {
+  vdom?: string;
+  /**
+   * Asked when the read gets its slot (reads beyond FORTIOS_CONCURRENCY wait in a queue): an
+   * error returned here is thrown instead of sending the request. A tool uses it to stop its
+   * queued reads after a 429.
+   */
+  cancelled?: () => Error | undefined;
+  /** Called with a 429 while the read still holds its slot (before any queued read starts). */
+  onRateLimited?: (err: ForticloudRateLimitError) => void;
+}
+
 /** The read-only API handed to tools. */
 export interface Api {
   /** POST to an Asset Management read endpoint; body `status` checked (1008 = no records gives `{}` fields empty). */
@@ -458,7 +477,7 @@ export interface Api {
   /** GET from FortiGate Cloud. */
   fgt<T = unknown>(path: string, query?: Record<string, string | number | undefined>): Promise<T>;
   /** GET one allowlisted FortiOS endpoint on a FortiGate through FortiGate Cloud; only allowlisted fields come back. */
-  fortios(serial: string, endpoint: FortiosEndpointName, options?: { vdom?: string }): Promise<FortiosResult>;
+  fortios(serial: string, endpoint: FortiosEndpointName, options?: FortiosOptions): Promise<FortiosResult>;
   /** Issues (or reuses) the token for a portal; for the status tool. */
   token(portal: Portal): Promise<{ secondsLeft?: number }>;
   readonly config: Pick<ForticloudConfig, 'assetUrl' | 'fgtUrl' | 'authUrl' | 'assetClientId' | 'fgtClientId'>;

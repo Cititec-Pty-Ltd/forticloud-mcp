@@ -91,7 +91,17 @@ async function get(ctx: Ctx, endpoint: FortiosEndpointName, read: string): Promi
     return { ok: false, read, fail: { read, reason: 'rate_limited', error: `not asked: FortiCloud rate-limited an earlier read; try again in ${s} s`, retryAfterSeconds: s } };
   }
   try {
-    const res = await ctx.api.fortios(ctx.sn, endpoint, ctx.vdom !== undefined ? { vdom: ctx.vdom } : {});
+    const res = await ctx.api.fortios(ctx.sn, endpoint, {
+      ...(ctx.vdom !== undefined ? { vdom: ctx.vdom } : {}),
+      // A read queued behind the client's slot limit is not sent once another read got a 429.
+      cancelled: () =>
+        ctx.rateLimit
+          ? new ForticloudRateLimitError(`not asked: FortiCloud rate-limited an earlier read; try again in ${ctx.rateLimit.retryAfterSeconds} s`, ctx.rateLimit.retryAfterSeconds)
+          : undefined,
+      onRateLimited: (err) => {
+        ctx.rateLimit ??= err;
+      },
+    });
     ctx.meta.version ??= res.version;
     ctx.meta.build ??= res.build;
     ctx.meta.vdom ??= res.vdom;
@@ -130,6 +140,7 @@ async function readSdwan(ctx: Ctx): Promise<Got & { legacy?: boolean }> {
 const MORE = 'raise max_rows to see them';
 
 interface StaticRoute extends Raw {
+  linkMonitorExempt?: true;
   seq?: number;
   destination: string;
   destinationAddress?: string;
@@ -245,6 +256,8 @@ interface LinkMonitor {
   servers?: string[];
   protocol?: string;
   gatewayIp?: string;
+  /** The monitor's `route` list: when set, only routes to these subnets are removed. */
+  routes?: string[];
   live?: Raw[];
 }
 
@@ -429,6 +442,8 @@ export interface Candidate {
   seq?: number;
   status?: string;
   blackhole?: true;
+  /** link-monitor-exempt: no link-monitor removes this route. */
+  linkMonitorExempt?: true;
   sdwanZone?: string;
   liveType?: string;
   monitoredBy?: string[];
@@ -480,9 +495,16 @@ export interface Signals {
   sdwanDown: Map<string, string[]>;
 }
 
+/** The link monitors that can remove this route: same interface (and gateway, when the monitor names one), the route not exempt, and inside the monitor's own route list when it has one. */
 function monitorsFor(c: Candidate, s: Signals) {
+  if (c.linkMonitorExempt) return [];
   return s.monitors.filter(
-    (m) => enabled(m.status) && m.updateStaticRoute !== 'disable' && m.interface === c.interface && (!m.gatewayIp || !c.gateway || m.gatewayIp === c.gateway)
+    (m) =>
+      enabled(m.status) &&
+      m.updateStaticRoute !== 'disable' &&
+      m.interface === c.interface &&
+      (!m.gatewayIp || !c.gateway || m.gatewayIp === c.gateway) &&
+      (!m.routes?.length || m.routes.includes(c.destination))
   );
 }
 
@@ -525,7 +547,16 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
       }
     } else {
       cands.push(
-        compact({ ...base, source: 'static', gateway: s.gateway, interface: s.blackhole ? 'blackhole' : s.interface, priority: s.priority, weight: s.weight, blackhole: s.blackhole }) as Candidate
+        compact({
+          ...base,
+          source: 'static',
+          gateway: s.gateway,
+          interface: s.blackhole ? 'blackhole' : s.interface,
+          priority: s.priority,
+          weight: s.weight,
+          blackhole: s.blackhole,
+          linkMonitorExempt: s.linkMonitorExempt,
+        }) as Candidate
       );
     }
   }
@@ -650,6 +681,9 @@ function summarize(input: {
   const defaults = candidates.filter((c) => c.destination === '0.0.0.0/0' && !c.blackhole);
   const liveDefaults = defaults.filter((c) => c.inRoutingTable);
   const sdwanMembers = (sdwan?.members ?? []).filter((m) => enabled(m.status));
+  // Live-only defaults from a routing protocol (BGP, OSPF...), not from the interface (DHCP, PPPoE) or config.
+  const dynamicDefaults = defaults.filter((c) => !c.configured && c.liveType && !/^(static|dhcp|pppoe|connect|kernel)$/i.test(c.liveType));
+  const dynamicTypes = [...new Set(dynamicDefaults.map((c) => c.liveType))].join(', ');
 
   if (!liveGot.ok) caveats.push(`The live routing table could not be read (${liveGot.fail.reason}), so which route is active is not known.`);
   else if (liveDefaults.length === 0) caveats.push('The live routing table has no default route (0.0.0.0/0).');
@@ -662,7 +696,10 @@ function summarize(input: {
   const sdwanOn = !!sdwan?.enabled && sdwanMembers.length > 0;
   const sdwanKnown = sdwanGot.ok || sdwanGot.fail.reason === 'not_supported';
   const lmKnown = lmGot.ok || lmGot.fail.reason === 'not_supported';
-  const lmOnDefaults = updating.filter((m) => m.interface && defaultIfaces.has(m.interface));
+  // Monitors that can actually remove a default route (exemptions and their own route lists honoured).
+  const lmOnDefaults = updating.filter((m) =>
+    defaults.some((c) => enabled(c.status) && c.source !== 'sdwan' && monitorsFor(c, { monitors: [m], sdwanDown: new Map() }).length > 0)
+  );
   const describeLm = (m: LinkMonitor) =>
     `${m.interface ?? '?'} (${m.name ?? '?'}${m.servers ? ` -> ${m.servers.join(', ')}` : ''}${m.protocol ? `, ${m.protocol}` : ''})`;
   const routeList = (rs: StaticRoute[]) => rs.map(routeText).join('; ');
@@ -700,8 +737,14 @@ function summarize(input: {
   } else if (!lmKnown) {
     failover = 'unknown';
     summary = `Unknown: SD-WAN is not in use, but the link-monitor settings could not be read (${reasonOf(lmGot)}), so static routes with or without link-monitor cannot be told apart.`;
+  } else if (dynamicDefaults.length && !enabledDefaults.length) {
+    failover = 'unknown';
+    summary =
+      `Not SD-WAN or link-monitor: the default route is learned by ${dynamicTypes} (a routing protocol), not configured. ` +
+      'Failover follows that protocol, which can withdraw a route while the interface stays up.';
   } else if (defaults.some((c) => enabled(c.status))) {
     failover = 'static-routes-distance-priority';
+    if (dynamicDefaults.length) caveats.push(`A default route is also learned by ${dynamicTypes} (a routing protocol); it can be withdrawn while its interface stays up.`);
     const paths = new Set(defaults.filter((c) => enabled(c.status)).map((c) => `${c.interface}|${c.gateway ?? ''}`)).size;
     summary =
       'Static routes by distance/priority only, no health check: a default route leaves the table only when its interface goes down, not when the ISP stops passing traffic.' +
@@ -747,8 +790,17 @@ async function getRouting(args: Raw, api: Api) {
   // or a FortiOS permission error on this one read does not stop the rest.
   const staticGot = await get(ctx, 'staticRoutes', READ.static);
   if (!staticGot.ok && staticGot.fail.reason === 'rate_limited') throw ctx.rateLimit!;
-  const down = !staticGot.ok && staticGot.deviceDown;
-  const skip = (read: string) => notTried(read, `not tried: the ${READ.static} read failed, so the device is probably not reachable through FortiGate Cloud`);
+  // A 404 for a serial FortiGate Cloud does not list is the device missing, not an old FortiOS:
+  // every other read would 404 too and spend FortiGate Cloud's small error budget.
+  const unknownDevice = !staticGot.ok && staticGot.fail.reason === 'not_supported' && !device.row.connection && !!device.note;
+  const down = !staticGot.ok && (staticGot.deviceDown || unknownDevice);
+  const skip = (read: string) =>
+    notTried(
+      read,
+      unknownDevice
+        ? `not tried: the ${READ.static} read answered 404 and this serial is not in the FortiGate Cloud device list`
+        : `not tried: the ${READ.static} read failed, so the device is probably not reachable through FortiGate Cloud`
+    );
 
   const [policyGot, lmGot, lmLiveGot, sdwanGot, hcGot, memGot, liveGot, ifGot, ipsecGot] = down
     ? [READ.policy, READ.lmConfig, READ.lmLive, READ.sdwan, READ.hcLive, READ.membersLive, READ.routesLive, READ.ifLive, READ.ipsecLive].map(skip)

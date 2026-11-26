@@ -684,3 +684,100 @@ describe('routeCandidates: every path per destination, like the routing-table da
     expect(rc.ipsecLiveError).toMatchObject({ read: 'monitor vpn/ipsec', reason: 'not_supported' });
   });
 });
+
+describe('forticloud_get_routing: review fixes', () => {
+  it('reads queued behind the client slot limit are not sent after a 429', async () => {
+    const slow = (body: unknown) => async () => {
+      await new Promise((r) => setTimeout(r, 40));
+      return json(body);
+    };
+    // Nine reads after the static routes; six get a slot. The first answers 429 at once, so the
+    // three queued ones (live table, interfaces, IPsec) must not be sent when slots free up.
+    const { fn, calls } = fakeForticloud(
+      routingRoutes(SN, {
+        ...STATIC_ONLY,
+        'cmdb/router/policy': json({}, 429, { 'Retry-After': '120' }),
+        'cmdb/system/link-monitor': slow(envelope([])),
+        'monitor/system/link-monitor': slow(envelope({})),
+        'cmdb/system/sdwan': slow(envelope(DISABLED_SDWAN)),
+        'monitor/virtual-wan/health-check': slow(envelope({})),
+        'monitor/virtual-wan/members': slow(envelope({})),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    const sent = fortiosCalls(calls).map((c) => c.url.pathname.split('/api/v2/')[1]);
+    for (const p of ['monitor/router/ipv4', 'monitor/system/interface', 'monitor/vpn/ipsec']) expect(sent).not.toContain(p);
+    expect(out.rateLimited).toMatchObject({ retryAfterSeconds: 120 });
+    expect(out.unreadable).toEqual(
+      expect.arrayContaining([
+        { read: 'monitor router/ipv4', reason: 'rate_limited', retryAfterSeconds: 120 },
+        { read: 'monitor vpn/ipsec', reason: 'rate_limited', retryAfterSeconds: 120 },
+      ])
+    );
+    expect(out.routeCandidates.ipsecLiveError.error).toMatch(/^not asked/);
+  });
+
+  it('link-monitor-exempt routes and routes outside a monitor\'s own route list are not tied to it', async () => {
+    const reads = {
+      ...LINK_MONITOR,
+      'cmdb/router/static': json(
+        envelope([
+          { 'seq-num': 1, dst: '0.0.0.0 0.0.0.0', gateway: '198.51.100.1', device: 'wan1', distance: 10, status: 'enable' },
+          { 'seq-num': 2, dst: '0.0.0.0 0.0.0.0', gateway: '203.0.113.1', device: 'wan2', distance: 20, status: 'enable' },
+          { 'seq-num': 3, dst: '0.0.0.0 0.0.0.0', gateway: '198.51.100.1', device: 'wan1', distance: 30, status: 'enable', 'link-monitor-exempt': 'enable' },
+        ])
+      ),
+    };
+    const { fn } = fakeForticloud(routingRoutes(SN, reads));
+    setFetchForTests(fn);
+    const rc = dataOf(await call({ serial: SN })).routeCandidates.routes;
+    expect(rc[0]).toMatchObject({ distance: 10, state: 'inactive', reason: 'link-monitor lm-wan1 reports wan1 dead', monitoredBy: ['lm-wan1'] });
+    expect(rc[2]).toMatchObject({ distance: 30, linkMonitorExempt: true, state: 'standby', reason: 'wan2 wins with a lower distance' });
+    expect(rc[2].monitoredBy).toBeUndefined();
+
+    // lm-wan1 removes only routes to 198.51.100.128/25, so it does not do WAN failover.
+    const scoped = envelope([
+      { name: 'lm-wan1', srcintf: 'wan1', server: [{ address: '192.0.2.53' }], protocol: 'ping', route: [{ subnet: '198.51.100.128 255.255.255.128' }], 'update-static-route': 'enable', status: 'enable' },
+    ]);
+    const { fn: fn2 } = fakeForticloud(routingRoutes(SN, { ...STATIC_ONLY, 'cmdb/system/link-monitor': json(scoped), 'monitor/system/link-monitor': json(envelope({ 'lm-wan1': { wan1: { status: 'dead' } } })) }));
+    setFetchForTests(fn2);
+    const out2 = dataOf(await call({ serial: SN }));
+    expect(out2.linkMonitors.monitors[0].routes).toEqual(['198.51.100.128/25']);
+    expect(out2.summary.failover).toBe('static-routes-distance-priority');
+    expect(out2.routeCandidates.routes[0]).toMatchObject({ interface: 'wan1', state: 'active' });
+    expect(out2.routeCandidates.routes[0].monitoredBy).toBeUndefined();
+  });
+
+  it('a default route learned by a routing protocol is not called static failover', async () => {
+    const { fn } = fakeForticloud(
+      routingRoutes(SN, { 'cmdb/router/static': json(envelope([])), 'monitor/router/ipv4': json(envelope([connected, { ...liveDefault('wan1', '198.51.100.1', 20, 0), type: 'bgp' }])) })
+    );
+    setFetchForTests(fn);
+    const s = dataOf(await call({ serial: SN })).summary;
+    expect(s.failover).toBe('unknown');
+    expect(s.text).toMatch(/learned by bgp \(a routing protocol\)/);
+    expect(s.text).not.toMatch(/DHCP or PPPoE/);
+    expect(s.defaultRoutes[0]).toMatchObject({ source: 'other', liveType: 'bgp', state: 'active' });
+
+    // Next to a static default route, a protocol-learned one is a caveat.
+    const { fn: fn2 } = fakeForticloud(
+      routingRoutes(SN, { ...STATIC_ONLY, 'monitor/router/ipv4': json(envelope([liveDefault('wan1', '198.51.100.1', 10, 1), { ...liveDefault('wan3', '192.0.2.77', 20, 0), type: 'ospf' }])) })
+    );
+    setFetchForTests(fn2);
+    const s2 = dataOf(await call({ serial: SN })).summary;
+    expect(s2.failover).toBe('static-routes-distance-priority');
+    expect(s2.caveats).toEqual(expect.arrayContaining([expect.stringMatching(/also learned by ospf/)]));
+  });
+
+  it('a 404 for a serial FortiGate Cloud does not list stops after the first read', async () => {
+    const NOT_LISTED = 'FGT60FTK00000099';
+    const { fn, calls } = fakeForticloud(routingRoutes(NOT_LISTED, { 'cmdb/router/static': notFound }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: NOT_LISTED }));
+    expect(fortiosCalls(calls)).toHaveLength(1);
+    expect(out.note).toMatch(/not in the FortiGate Cloud device list/);
+    expect(out.policyRoutes).toMatchObject({ reason: 'not_tried' });
+    expect(out.policyRoutes.error).toMatch(/answered 404 and this serial is not in the FortiGate Cloud device list/);
+  });
+});
