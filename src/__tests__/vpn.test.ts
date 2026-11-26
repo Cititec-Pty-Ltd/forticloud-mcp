@@ -1098,4 +1098,11 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(line).toContain('traffic 198.51.100.0/24 -> 203.0.113.0/24 has a path only via to-hq-4g');
     expect(line).not.toMatch(/should work/);
   });
+
+  it('a broad primary selector only needs the backup to cover the routed part of it', async () => {
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre', '0.0.0.0 0.0.0.0'), phase2('to-hq-4g')])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+  });
 });

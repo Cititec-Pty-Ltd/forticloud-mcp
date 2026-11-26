@@ -613,11 +613,14 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
       // Only selectors for subnets the primary routes: a selector with no route carries no traffic to fail over.
       const routed = liveRoutes(p).map((r) => routeNet(r.destination)).filter((n): n is Net4 => !!n);
       const unmatched: string[] = [];
-      for (const x of pSel.filter((x) => routed.some((n) => overlaps(n, x.remote)))) {
-        const c = selectorsCover(bSel, x.local, x.remote);
-        if (c === false) unmatched.push(x.text);
-        else if (c === undefined) selectorsUnknown = true;
-      }
+      // Only the routed part of each primary selector has to be covered: its remote side clipped to
+      // each destination the primary routes.
+      for (const x of pSel)
+        for (const n of routed.filter((n) => overlaps(n, x.remote))) {
+          const c = selectorsCover(bSel, x.local, narrower(x.remote, n));
+          if (c === false) unmatched.push(x.text);
+          else if (c === undefined) selectorsUnknown = true;
+        }
       if (unmatched.length) problems.push(`backup ${b.name}'s phase 2 selectors do not cover all of the primary's ${[...new Set(unmatched)].join(', ')}: that traffic cannot use the backup`);
     }
   }
