@@ -600,9 +600,12 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   if (p?.dpd?.mode === 'disable') problems.push(DPD_OFF(p.name, 'primary '));
   if (f.routesKnown && f.sdwanKnown && f.bgpKnown && !carries(b)) problems.push(`backup ${b.name} has no route using it: it will come up but carry no traffic`);
   if (p && f.routesKnown && f.sdwanKnown && f.bgpKnown && !carries(p)) problems.push(`primary ${p.name} has no route using it`);
-  if (p && f.routesKnown && f.sdwanKnown && f.bgpKnown && !b.sdwanMember && !b.bgpNeighbors?.length && liveRoutes(b).length) {
+  // A backup with BGP still has its phase 2 selectors checked; only the static route check is skipped,
+  // since BGP can bring the routes it lacks.
+  const backupBgp = !!b.bgpNeighbors?.length;
+  if (p && f.routesKnown && f.sdwanKnown && f.bgpKnown && !b.sdwanMember && (backupBgp || liveRoutes(b).length)) {
     // A backup route covers a primary destination when it is in the same VRF and its subnet contains it.
-    const missing = liveRoutes(p).filter((r) => !coveredBy(liveRoutes(b), r)).map((r) => r.destination);
+    const missing = backupBgp ? [] : liveRoutes(p).filter((r) => !coveredBy(liveRoutes(b), r)).map((r) => r.destination);
     if (missing.length) problems.push(`backup ${b.name} has no route to ${[...new Set(missing)].join(', ')}, which the primary carries`);
     // The backup's phase 2 selectors must let that traffic through too.
     const sels = selectorNets(b, f);

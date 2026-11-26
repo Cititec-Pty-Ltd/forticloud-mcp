@@ -1123,4 +1123,29 @@ describe('forticloud_get_vpn: review fixes', () => {
     const out = dataOf(await call({ serial: SN }));
     expect(out.pairs[0].problems).toContain('backup to-hq-4g has no route to 203.0.113.0/24, which the primary carries');
   });
+
+  const backupBgp = {
+    'cmdb/router/bgp': json(envelope({ as: '65001', neighbor: [{ ip: '192.0.2.250', 'remote-as': '65000', interface: 'to-hq-4g' }] })),
+    'monitor/router/bgp/neighbors': json(envelope([{ neighbor_ip: '192.0.2.250', admin_status: true, state: 'Established' }])),
+  };
+
+  it('a backup with BGP still has its phase 2 selectors checked against the primary', async () => {
+    const otherLocal = { ...phase2('to-hq-4g'), 'src-subnet': '198.51.100.0 255.255.255.0' };
+    const { fn } = fakeForticloud(vpnRoutes(SN, { ...backupBgp, 'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), otherLocal])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.tunnels.tunnels[1].bgpNeighbors).toEqual(['192.0.2.250']);
+    expect(out.pairs[0].healthy).toBe(false);
+    expect(out.pairs[0].problems).toContain('backup to-hq-4g\x27s phase 2 selectors do not cover all of the primary\x27s 192.0.2.0/24 -> 203.0.113.0/24: that traffic cannot use the backup');
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+  });
+
+  it('a backup with BGP and covering selectors needs no static route of its own', async () => {
+    const { fn } = fakeForticloud(vpnRoutes(SN, { ...backupBgp, 'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10)])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.tunnels.tunnels[1].bgpNeighbors).toEqual(['192.0.2.250']);
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+    expect(out.pairs[0].problems).toBeUndefined();
+  });
 });
