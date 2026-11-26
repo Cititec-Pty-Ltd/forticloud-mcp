@@ -185,8 +185,9 @@ function statusOf(up: number, total: number): TunnelStatus {
 }
 
 function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
-  // A cut phase 2 config list may leave out a selector that is not negotiated (in neither list).
-  const p2ConfigCut = p2Got.ok && !!(p2Got.res.truncated || p2Got.res.nestedCut);
+  // A phase 2 config list that is cut or could not be read may leave out a selector that is not
+  // negotiated (in neither list).
+  const p2ConfigCut = !p2Got.ok || !!(p2Got.res.truncated || p2Got.res.nestedCut);
   const p2ByP1 = new Map<string, Raw[]>();
   for (const p of p2Got.ok ? p2Got.res.rows : []) {
     const k = String(p.phase1name ?? '');
@@ -254,7 +255,7 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
           statusNote = `state unknown: ${phase2Up} of ${phase2Count} phase 2 selector(s) read are up, ${unknownP2} not in the part of the live list read (it was cut)`;
         } else if (p2ConfigCut && phase2Up === phase2Count) {
           status = undefined;
-          statusNote = `state unknown: the ${phase2Up} phase 2 selector(s) read are up, but the phase 2 configuration list was cut, so a selector that is not negotiated may be missing`;
+          statusNote = `state unknown: the ${phase2Up} phase 2 selector(s) read are up, but the phase 2 configuration could not be read in full, so a selector that is not negotiated may be missing`;
         } else status = statusOf(phase2Up, phase2Count);
         liveInfo = compact({
           remoteGateway: addr(l.rgwy),
@@ -527,7 +528,7 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   if (p?.dpd?.mode === 'disable') problems.push(DPD_OFF(p.name, 'primary '));
   if (f.routesKnown && f.sdwanKnown && f.bgpKnown && !carries(b)) problems.push(`backup ${b.name} has no route using it: it will come up but carry no traffic`);
   if (p && f.routesKnown && f.sdwanKnown && f.bgpKnown && !carries(p)) problems.push(`primary ${p.name} has no route using it`);
-  if (p && f.routesKnown && !b.sdwanMember && !b.bgpNeighbors?.length && liveRoutes(b).length) {
+  if (p && f.routesKnown && f.sdwanKnown && f.bgpKnown && !b.sdwanMember && !b.bgpNeighbors?.length && liveRoutes(b).length) {
     // A backup route covers a primary destination when it is in the same VRF and its subnet contains it.
     const missing = liveRoutes(p).filter((r) => !coveredBy(liveRoutes(b), r)).map((r) => r.destination);
     if (missing.length) problems.push(`backup ${b.name} has no route to ${[...new Set(missing)].join(', ')}, which the primary carries`);

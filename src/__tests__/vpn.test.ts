@@ -908,7 +908,7 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(out.truncatedReads).toContain('cmdb vpn.ipsec/phase2-interface');
     const fibre = out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-fibre');
     expect(fibre.status).toBeUndefined();
-    expect(fibre.statusNote).toMatch(/phase 2 configuration list was cut/);
+    expect(fibre.statusNote).toMatch(/phase 2 configuration could not be read in full/);
     expect(out.pairs[0].healthy).not.toBe(true);
     expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
   });
@@ -926,5 +926,30 @@ describe('forticloud_get_vpn: review fixes', () => {
     const out = dataOf(await call({ serial: SN }));
     expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route using it/));
     expect(out.summary.caveats).toContainEqual(expect.stringMatching(/Not every BGP neighbor could be placed on a tunnel/));
+  });
+
+  it('an unreadable phase 2 configuration keeps an all-up primary unknown', async () => {
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/vpn.ipsec/phase2-interface': json({ status: 'error', http_status: 403 }, 403) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    const fibre = out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-fibre');
+    expect(fibre.status).toBeUndefined();
+    expect(fibre.statusNote).toMatch(/phase 2 configuration could not be read in full/);
+    expect(out.pairs[0].healthy).not.toBe(true);
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+  });
+
+  it('destination coverage is not judged when BGP neighbors could not all be placed on a tunnel', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-fibre', 10, '198.51.100.0 255.255.255.0'), route(3, 'to-hq-4g', 15)])),
+        'cmdb/system/interface': json({ status: 'error', http_status: 403 }, 403),
+        'cmdb/router/bgp': json(envelope({ as: '65001', 'router-id': '192.0.2.1', neighbor: [{ ip: '192.0.2.4', 'remote-as': '65000' }], 'neighbor-group': [], 'neighbor-range': [] })),
+        'monitor/router/bgp/neighbors': notFound(),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route to 198\.51\.100\.0\/24/));
   });
 });
