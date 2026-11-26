@@ -464,6 +464,8 @@ interface Facts {
   liveKnown: boolean;
   /** The phase 1 list was complete, so a tunnel missing from it is not configured. */
   phase1Complete: boolean;
+  /** The phase 2 list was complete, so a tunnel's selectors are all known. */
+  phase2Complete: boolean;
   /** BGP neighbors were read completely (or BGP is not on this FortiOS), so a tunnel with none has none. */
   bgpKnown: boolean;
 }
@@ -520,7 +522,20 @@ const DPD_OFF = (t: string, role: string) =>
 
 /** The routing checks (static routes, SD-WAN, BGP) ran on complete data. */
 const routingKnown = (f: Facts) => f.routesKnown && f.sdwanKnown && f.bgpKnown;
-const ROUTING_UNKNOWN = 'the routes could not be read in full, so whether the tunnels carry the traffic is not known';
+const ROUTING_UNKNOWN = 'the routes or phase 2 selectors could not be checked in full, so whether the tunnels carry the traffic is not known';
+
+/** The remote subnets of a tunnel's configured phase 2 selectors, or undefined when they are not all known
+ * (the phase 2 list incomplete, more selectors than shown, or a selector given as an address name or range). */
+/** Two networks share addresses: one contains the other. A route only partly inside a selector still
+ * carries the part the selector lets through, so overlap (not containment) is the test. */
+const overlaps = (a: { ip: number; prefix: number }, b: { ip: number; prefix: number }) =>
+  a.prefix <= b.prefix ? contains(a, b.ip) : contains(b, a.ip);
+
+function selectorNets(t: Tunnel, f: Facts): { ip: number; prefix: number }[] | undefined {
+  if (!f.phase2Complete || t.phase2Total !== undefined || !t.phase2?.length) return undefined;
+  const nets = t.phase2.map((p) => (p.remote ? routeNet(p.remote) : undefined));
+  return nets.every((n) => !!n) ? (nets as { ip: number; prefix: number }[]) : undefined;
+}
 
 function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   const p = f.byName.get(primaryName);
@@ -528,6 +543,7 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   const hold = holdText(b);
   // Missing from a cut phase 1 list: it may be configured further down.
   const primaryOmitted = !p && !f.phase1Complete;
+  let selectorsUnknown = false;
   if (!p && !primaryOmitted) problems.push(`backup ${b.name} is set to monitor ${primaryName}, which is not configured, so it never takes over from anything`);
   if (p?.dpd?.mode === 'disable') problems.push(DPD_OFF(p.name, 'primary '));
   if (f.routesKnown && f.sdwanKnown && f.bgpKnown && !carries(b)) problems.push(`backup ${b.name} has no route using it: it will come up but carry no traffic`);
@@ -536,6 +552,19 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
     // A backup route covers a primary destination when it is in the same VRF and its subnet contains it.
     const missing = liveRoutes(p).filter((r) => !coveredBy(liveRoutes(b), r)).map((r) => r.destination);
     if (missing.length) problems.push(`backup ${b.name} has no route to ${[...new Set(missing)].join(', ')}, which the primary carries`);
+    // The backup's phase 2 selectors must let that traffic through too.
+    const sels = selectorNets(b, f);
+    if (!sels) selectorsUnknown = true;
+    else {
+      const outside = liveRoutes(p)
+        .filter((r) => coveredBy(liveRoutes(b), r))
+        .filter((r) => {
+          const rn = routeNet(r.destination);
+          return !!rn && !sels.some((n) => overlaps(n, rn));
+        })
+        .map((r) => r.destination);
+      if (outside.length) problems.push(`backup ${b.name}'s phase 2 selectors do not include ${[...new Set(outside)].join(', ')}, which the primary carries: that traffic cannot use the backup`);
+    }
   }
 
   const unknownOf = [p, b].filter((t): t is Tunnel => !!t && t.status === undefined).map((t) => t.name);
@@ -574,7 +603,7 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
       problems.push(`primary ${p.name} is only partly up (${p.phase2Up} of ${p.phase2Count} phase 2 up): the down selectors have no path unless the backup comes up`);
     if (b.status === 'partially up' && shouldActivate) problems.push(`backup ${b.name} is only partly up (${b.phase2Up} of ${b.phase2Count} phase 2 up)`);
     // No problem found is 'healthy' only when the routing checks ran on complete data.
-    healthy = problems.length ? false : routingKnown(f) ? true : undefined;
+    healthy = problems.length ? false : routingKnown(f) && !selectorsUnknown ? true : undefined;
   } else if (multi && p && !allKnown) {
     const names = b.backupOf ?? [primaryName];
     const unk = names.filter((_, i) => !monitored[i] || monitored[i]!.status === undefined);
@@ -605,7 +634,7 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
       problems.push(`primary ${p.name} is only partly up (${p.phase2Up} of ${p.phase2Count} phase 2 up): the backup stays idle while any of the primary is up, so the down selectors have no path`);
     if (b.status === 'partially up' && !pUp) problems.push(`backup ${b.name} is only partly up (${b.phase2Up} of ${b.phase2Count} phase 2 up)`);
     // No problem found is 'healthy' only when the routing checks ran on complete data.
-    healthy = problems.length ? false : routingKnown(f) ? true : undefined;
+    healthy = problems.length ? false : routingKnown(f) && !selectorsUnknown ? true : undefined;
   } else if (primaryOmitted) {
     state = `unknown: ${primaryName} is not in the part of the phase 1 list read (it was cut)`;
   } else if (!p) {
@@ -728,6 +757,17 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
       const up = g.filter((t) => t.status !== undefined && t.status !== 'down');
       if (g.every((t) => t.status === 'down')) problems.push(`all of ${label} are down: no tunnel to this site`);
       // Each subnet needs a route over more than one tunnel, or nothing takes over when its tunnel fails.
+      let selUnknown = false;
+      // A tunnel can carry a destination when it has a covering route and its selectors include it.
+      const passes = (o: Tunnel, r: TunnelRoute) => {
+        const sels = selectorNets(o, f);
+        if (!sels) {
+          selUnknown = true;
+          return true;
+        }
+        const rn = routeNet(r.destination);
+        return !rn || sels.some((n) => overlaps(n, rn));
+      };
       if (f.routesKnown && f.sdwanKnown && f.bgpKnown) {
         const via = new Map<string, { dst: string; route: TunnelRoute; tunnels: Set<string> }>();
         for (const t of g)
@@ -738,11 +778,17 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
             via.set(k, e);
           }
         const only = new Map<string, string[]>();
-        for (const { dst, route, tunnels } of via.values()) {
-          if (tunnels.size !== 1) continue;
-          const [t] = [...tunnels];
-          // Another tunnel with a covering route (a wider subnet in the same VRF) takes over too.
-          if (g.some((o) => o.name !== t && coveredBy(liveRoutes(o), route))) continue;
+        for (const { dst, route } of via.values()) {
+          // The tunnels that can carry it: a covering route (a wider subnet in the same VRF counts) and
+          // phase 2 selectors that include it.
+          const carriers = g.filter((o) => coveredBy(liveRoutes(o), route) && passes(o, route));
+          if (!carriers.length) {
+            const routed = g.filter((o) => coveredBy(liveRoutes(o), route)).map((o) => o.name);
+            problems.push(`${dst} is routed via ${routed.join(', ')}, but no tunnel's phase 2 selectors include it: that traffic has no path`);
+            continue;
+          }
+          if (carriers.length !== 1) continue;
+          const t = carriers[0].name;
           // BGP over another tunnel of the site may carry a backup route the static routes do not show.
           if (g.some((o) => o.name !== t && o.bgpNeighbors?.length)) continue;
           only.set(t, [...(only.get(t) ?? []), dst]);
@@ -754,7 +800,7 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
       for (const t of g) if (t.status === 'down' && up.length) problems.push(`${t.name} is down: the site is reached over ${up.map((u) => u.name).join(', ')}`);
       const desc = g.map((t) => `${t.name} ${stateWord(t)} (${dpdText(t)})`).join('; ');
       const allKnown = g.every((t) => t.status !== undefined);
-      const ok = !f.liveKnown ? 'Failover is by route distance; the live state could not be read.' : !allKnown ? `Failover is by route distance; the live state of ${g.filter((t) => t.status === undefined).map((t) => t.name).join(', ')} is not known, so whether it would take over is not known.` : !routingKnown(f) ? `Failover is by route distance, but ${ROUTING_UNKNOWN}.` : 'Failover by route distance should work: when a tunnel goes down its routes leave the table and the next one takes over.';
+      const ok = !f.liveKnown ? 'Failover is by route distance; the live state could not be read.' : !allKnown ? `Failover is by route distance; the live state of ${g.filter((t) => t.status === undefined).map((t) => t.name).join(', ')} is not known, so whether it would take over is not known.` : !routingKnown(f) || selUnknown ? `Failover is by route distance, but ${ROUTING_UNKNOWN}.` : 'Failover by route distance should work: when a tunnel goes down its routes leave the table and the next one takes over.';
       out.push({
         tunnels: g.map((t) => t.name),
         method: 'routing',
@@ -864,6 +910,7 @@ async function getVpn(args: Raw, api: Api) {
     sdwanKnown: memGot.ok ? !memGot.res.truncated && !memGot.res.nestedCut : memGot.fail.reason === 'not_supported',
     liveKnown: liveGot.ok,
     phase1Complete: p1Got.ok && !p1Got.res.truncated,
+    phase2Complete: p2Got.ok && !p2Got.res.truncated && !p2Got.res.nestedCut,
     bgpKnown: (() => {
       const whole = (g: Got) => g.ok && !g.res.truncated && !g.res.nestedCut;
       const cfg = bgpGot.ok ? whole(bgpGot) : bgpGot.fail.reason === 'not_supported';

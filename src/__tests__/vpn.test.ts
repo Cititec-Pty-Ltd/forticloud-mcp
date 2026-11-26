@@ -441,7 +441,7 @@ describe('forticloud_get_vpn', () => {
     // called healthy and the site does not say "should work".
     expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle' });
     expect(out.pairs[0].healthy).toBeUndefined();
-    expect(out.summary.sites[0]).toMatch(/Failover is set up and the tunnels look right now, but the routes could not be read in full/);
+    expect(out.summary.sites[0]).toMatch(/Failover is set up and the tunnels look right now, but the routes or phase 2 selectors could not be checked in full/);
     expect(out.summary.caveats).toEqual(expect.arrayContaining([expect.stringMatching(/static routes could not be read \(rate_limited\)/)]));
   });
 
@@ -630,7 +630,13 @@ describe('forticloud_get_vpn: review fixes', () => {
     const { fn } = fakeForticloud(
       vpnRoutes(SN, {
         'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
-        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+        'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), phase2('to-hq-fibre', '198.51.100.0 255.255.255.0', 'to-hq-fibre-b'), phase2('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(
+          envelope([
+            liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up'), sa('to-hq-fibre-b', 'up', '198.51.100.0/255.255.255.0')]),
+            liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')]),
+          ])
+        ),
         'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15), route(3, 'to-hq-fibre', 10, '198.51.100.0 255.255.255.0')])),
       })
     );
@@ -993,6 +999,54 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle' });
     expect(out.pairs[0].healthy).toBeUndefined();
     expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
-    expect(out.summary.sites[0]).toMatch(/the routes could not be read in full/);
+    expect(out.summary.sites[0]).toMatch(/the routes or phase 2 selectors could not be checked in full/);
+  });
+
+  it('a backup whose phase 2 selectors leave out a subnet the primary carries is flagged', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), phase2('to-hq-fibre', '198.51.100.0 255.255.255.0', 'to-hq-fibre-b'), phase2('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up'), sa('to-hq-fibre-b', 'up', '198.51.100.0/255.255.255.0')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'down')])])),
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-fibre', 10, '198.51.100.0 255.255.255.0'), route(3, 'to-hq-4g', 15), route(4, 'to-hq-4g', 15, '198.51.100.0 255.255.255.0')])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0].healthy).toBe(false);
+    expect(out.pairs[0].problems).toContain('backup to-hq-4g\x27s phase 2 selectors do not include 198.51.100.0/24, which the primary carries: that traffic cannot use the backup');
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+  });
+
+  it('a backup with a 0.0.0.0/0 selector covers every subnet', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, { 'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), phase2('to-hq-4g', '0.0.0.0 0.0.0.0')])) })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+  });
+
+  it('a backup selector given as an address name leaves readiness unknown', async () => {
+    const named = { ...phase2('to-hq-4g'), 'dst-addr-type': 'name', 'dst-name': 'hq-subnets' };
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), named])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0].problems).toBeUndefined();
+    expect(out.pairs[0].healthy).toBeUndefined();
+    expect(out.summary.sites[0]).toMatch(/phase 2 selectors could not be checked in full/);
+  });
+
+  it('route-distance: a destination routed over a tunnel whose selectors leave it out has no path', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15), route(3, 'to-hq-fibre', 10, '198.51.100.0 255.255.255.0'), route(4, 'to-hq-4g', 15, '198.51.100.0 255.255.255.0')])),
+      })
+    );
+    setFetchForTests(fn);
+    const line = dataOf(await call({ serial: SN })).summary.sites[0];
+    expect(line).toContain("198.51.100.0/24 is routed via to-hq-fibre, to-hq-4g, but no tunnel's phase 2 selectors include it: that traffic has no path");
+    expect(line).not.toMatch(/should work/);
   });
 });
