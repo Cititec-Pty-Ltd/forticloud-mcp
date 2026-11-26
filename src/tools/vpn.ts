@@ -245,11 +245,11 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
       if (l && !dialup) {
         phase2Up = phase2.filter((p) => p.state === 'up').length;
         phase2Count = phase2.filter((p) => p.state !== undefined).length;
-        // A configured selector the cut live list leaves out may be down: only all-down is certain then.
+        // A configured selector the cut live list leaves out may be up or down: the aggregate is unknown.
         const unknownP2 = phase2.length - phase2Count;
-        if (unknownP2 > 0 && p2Cut && phase2Up > 0) {
+        if (unknownP2 > 0 && p2Cut) {
           status = undefined;
-          statusNote = `state unknown: ${phase2Up} phase 2 selector(s) up, ${unknownP2} not in the part of the live list read (it was cut)`;
+          statusNote = `state unknown: ${phase2Up} of ${phase2Count} phase 2 selector(s) read are up, ${unknownP2} not in the part of the live list read (it was cut)`;
         } else status = statusOf(phase2Up, phase2Count);
         liveInfo = compact({
           remoteGateway: addr(l.rgwy),
@@ -319,10 +319,13 @@ function tunnelFor(n: NeighborRef, tunnels: Set<string>, nets: Map<string, Tunne
   if (n.updateSource && tunnels.has(n.updateSource)) return n.updateSource;
   const ip = parseIpv4(n.ip);
   const local = parseIpv4(n.localIp);
+  // Exact addresses first (the peer is a tunnel's remote end, or the session runs from a tunnel's
+  // own address), then the subnets, so overlapping tunnel subnets cannot win over an exact match.
+  for (const [name, t] of nets) if (ip !== undefined && t.remote && t.remote.ip === ip) return name;
+  for (const [name, t] of nets) if (local !== undefined && t.ip && t.ip.ip === local) return name;
   for (const [name, t] of nets) {
-    if (ip !== undefined && t.remote && (t.remote.ip === ip || (t.remote.prefix < 32 && contains(t.remote, ip)))) return name;
+    if (ip !== undefined && t.remote && t.remote.prefix < 32 && contains(t.remote, ip)) return name;
     if (ip !== undefined && t.ip && t.ip.prefix <= 31 && contains(t.ip, ip) && t.ip.ip !== ip) return name;
-    if (local !== undefined && t.ip && t.ip.ip === local) return name;
   }
   return undefined;
 }

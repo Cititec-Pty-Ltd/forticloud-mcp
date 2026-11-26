@@ -679,7 +679,7 @@ describe('forticloud_get_vpn: review fixes', () => {
     const out = dataOf(await call({ serial: SN }));
     const fibre = out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-fibre');
     expect(fibre.status).toBeUndefined();
-    expect(fibre.statusNote).toBe(`state unknown: ${MAX_NESTED} phase 2 selector(s) up, 1 not in the part of the live list read (it was cut)`);
+    expect(fibre.statusNote).toBe(`state unknown: ${MAX_NESTED} of ${MAX_NESTED} phase 2 selector(s) read are up, 1 not in the part of the live list read (it was cut)`);
     expect(out.pairs[0].healthy).not.toBe(true);
     expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
   });
@@ -817,5 +817,43 @@ describe('forticloud_get_vpn: review fixes', () => {
     setFetchForTests(fn);
     const line = dataOf(await call({ serial: SN })).summary.sites[0];
     expect(line).not.toMatch(/Problems:/);
+  });
+
+  it('a backup whose read selectors are all down but one was cut off is unknown, not idle', async () => {
+    const n = MAX_NESTED + 1;
+    const p2s = Array.from({ length: n }, (_, i) => phase2('to-hq-4g', '203.0.113.0 255.255.255.0', `lte-${i}`));
+    const sas = Array.from({ length: n }, (_, i) => sa(`lte-${i}`, 'down'));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), ...p2s])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', sas)])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    const lte = out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-4g');
+    expect(lte.status).toBeUndefined();
+    expect(out.pairs[0].healthy).not.toBe(true);
+    expect(out.pairs[0].backupState).not.toBe('idle');
+  });
+
+  it('BGP: an exact remote or local address wins over an overlapping subnet on another tunnel', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10)])),
+        'cmdb/system/interface': json(
+          envelope([
+            { name: 'to-hq-fibre', type: 'tunnel', ip: '192.0.2.1 255.255.255.255', 'remote-ip': '192.0.2.2 255.255.255.0' },
+            { name: 'to-hq-4g', type: 'tunnel', ip: '192.0.2.3 255.255.255.255', 'remote-ip': '192.0.2.4 255.255.255.0' },
+          ])
+        ),
+        'cmdb/router/bgp': json(envelope({ as: '65001', 'router-id': '192.0.2.1', neighbor: [{ ip: '192.0.2.4', 'remote-as': '65000' }], 'neighbor-group': [], 'neighbor-range': [] })),
+        'monitor/router/bgp/neighbors': json(envelope([{ neighbor_ip: '192.0.2.4', local_ip: '192.0.2.3', remote_as: 65000, admin_status: true, state: 'Established', type: 'ipv4' }])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.bgp.neighbors[0]).toMatchObject({ ip: '192.0.2.4', tunnel: 'to-hq-4g' });
+    expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/backup to-hq-4g has no route using it/));
   });
 });
