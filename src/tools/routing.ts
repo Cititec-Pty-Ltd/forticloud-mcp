@@ -445,6 +445,8 @@ export interface Candidate {
   /** link-monitor-exempt: no link-monitor removes this route. */
   linkMonitorExempt?: true;
   sdwanZone?: string;
+  /** An SD-WAN member's own priority (for SD-WAN rules); the route's priority stays in `priority`. */
+  memberPriority?: number;
   /** The VRF (routing table) the path is in; 0 when not given. Paths only compete within one VRF. */
   vrf?: number;
   liveType?: string;
@@ -546,7 +548,8 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
               source: 'sdwan',
               gateway: m.gateway ?? s.gateway,
               interface: m.interface,
-              priority: m.priority ?? s.priority,
+              priority: s.priority,
+              memberPriority: m.priority,
               weight: m.weight ?? s.weight,
               sdwanZone: m.zone ?? s.sdwanZones?.join(', '),
               status: !enabled(s.status) || !enabled(m.status) ? 'disable' : s.status,
@@ -582,7 +585,10 @@ export function buildCandidates(input: { statics?: StaticRoute[]; sdwan?: Sdwan;
   for (const l of live) {
     if (!l.destination) continue;
     // A disabled route is never installed; the same VRF, and the priority when both have one, break ties.
+    // A configured candidate is a static route: a route the live table learned by a protocol stays its own path.
+    const staticLive = !l.type || /^static$/i.test(l.type);
     const fits = (c: Candidate) =>
+      staticLive &&
       !matched.has(c) &&
       enabled(c.status) &&
       scopeKey(c) === scopeKey(l) &&

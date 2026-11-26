@@ -835,3 +835,45 @@ describe('forticloud_get_routing: second review fixes', () => {
     expect(out.summary.activeDefaultRoute).toBe('wan1 via 198.51.100.1 (distance 10, priority 0); VRF 1: wan2 via 203.0.113.1 (distance 20, priority 0)');
   });
 });
+
+describe('forticloud_get_routing: third review fixes', () => {
+  it('an SD-WAN path keeps the route priority; the member priority is shown on its own', async () => {
+    const sdwan = {
+      status: 'enable',
+      zone: [{ name: 'virtual-wan-link' }],
+      members: [
+        { 'seq-num': 1, interface: 'wan1', zone: 'virtual-wan-link', gateway: '198.51.100.1', priority: 1, status: 'enable' },
+        { 'seq-num': 2, interface: 'wan2', zone: 'virtual-wan-link', gateway: '203.0.113.1', priority: 10, status: 'enable' },
+      ],
+    };
+    const { fn } = fakeForticloud(
+      routingRoutes(SN, {
+        'cmdb/router/static': json(envelope([{ 'seq-num': 1, dst: '0.0.0.0 0.0.0.0', 'sdwan-zone': [{ name: 'virtual-wan-link' }], distance: 1, priority: 1, status: 'enable' }])),
+        'cmdb/system/sdwan': json(envelope(sdwan)),
+        'monitor/router/ipv4': json(envelope([liveDefault('wan1', '198.51.100.1', 1, 1), liveDefault('wan2', '203.0.113.1', 1, 1)])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.routeCandidates.routes.map((r: any) => [r.interface, r.priority, r.memberPriority, r.state])).toEqual([
+      ['wan1', 1, 1, 'active'],
+      ['wan2', 1, 10, 'active'],
+    ]);
+    expect(out.summary.activeDefaultRoute).toBe('wan1 via 198.51.100.1 (distance 1, priority 1); wan2 via 203.0.113.1 (distance 1, priority 1)');
+  });
+
+  it('a live route learned by a protocol is never merged into a static route with the same next hop', async () => {
+    const { fn } = fakeForticloud(
+      routingRoutes(SN, {
+        'cmdb/router/static': json(envelope([{ 'seq-num': 1, dst: '0.0.0.0 0.0.0.0', gateway: '198.51.100.1', device: 'wan1', distance: 20, priority: 0, status: 'enable' }])),
+        'monitor/router/ipv4': json(envelope([{ ...liveDefault('wan1', '198.51.100.1', 20, 0), type: 'bgp' }])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    const [stat, bgp] = out.routeCandidates.routes;
+    expect(stat).toMatchObject({ seq: 1, source: 'static', configured: true, inRoutingTable: false });
+    expect(bgp).toMatchObject({ source: 'other', liveType: 'bgp', configured: false, inRoutingTable: true, state: 'active' });
+    expect(out.summary.caveats).toEqual(expect.arrayContaining([expect.stringMatching(/also learned by bgp/)]));
+  });
+});
