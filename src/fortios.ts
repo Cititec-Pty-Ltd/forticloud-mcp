@@ -422,6 +422,152 @@ export const FORTIOS_ENDPOINTS = {
       comments: true,
     },
   },
+  /**
+   * IPsec phase 1 interfaces with their failover settings (forticloud_get_vpn): backup-of
+   * (`monitor`, a name on 6.4, a list on 7.x) and its hold-down, DPD, idle timeout, auto-negotiate,
+   * route and ADVPN switches. Never the pre-shared key (`psksecret`, `psksecret-remote`), the
+   * ADVPN key (`auto-discovery-psk`), certificates, peer IDs, XAUTH/EAP users or PPKs.
+   */
+  vpnPhase1: {
+    path: 'cmdb/vpn.ipsec/phase1-interface',
+    results: 'list',
+    maxItems: 500,
+    fields: {
+      name: true,
+      type: true,
+      interface: true,
+      'ike-version': true,
+      'remote-gw': true,
+      'remotegw-ddns': true,
+      'local-gw': true,
+      'mode-cfg': true,
+      monitor: { name: true },
+      'monitor-min': true,
+      'monitor-hold-down-type': true,
+      'monitor-hold-down-delay': true,
+      'monitor-hold-down-time': true,
+      'monitor-hold-down-weekday': true,
+      dpd: true,
+      'dpd-retrycount': true,
+      'dpd-retryinterval': true,
+      'idle-timeout': true,
+      'idle-timeoutinterval': true,
+      'auto-negotiate': true,
+      keepalive: true,
+      'net-device': true,
+      'add-route': true,
+      distance: true,
+      priority: true,
+      'exchange-interface-ip': true,
+      'auto-discovery-sender': true,
+      'auto-discovery-receiver': true,
+      'auto-discovery-forwarder': true,
+      'auto-discovery-shortcuts': true,
+      comments: true,
+    },
+  },
+  /** IPsec phase 2 selectors with auto-negotiate and keepalive (forticloud_get_vpn). */
+  vpnPhase2: {
+    path: 'cmdb/vpn.ipsec/phase2-interface',
+    results: 'list',
+    maxItems: 2_000,
+    fields: {
+      name: true,
+      phase1name: true,
+      'src-addr-type': true,
+      'src-subnet': true,
+      'src-start-ip': true,
+      'src-end-ip': true,
+      'src-name': true,
+      'dst-addr-type': true,
+      'dst-subnet': true,
+      'dst-start-ip': true,
+      'dst-end-ip': true,
+      'dst-name': true,
+      'auto-negotiate': true,
+      keepalive: true,
+      comments: true,
+    },
+  },
+  /**
+   * Live IPsec tunnels with byte counters per tunnel and per phase 2 (forticloud_get_vpn). The
+   * selectors are `proxy_src`/`proxy_dst` in the FortiOS reference and `proxysrc`/`proxydst` in
+   * some answers; both are kept. No dial-up user names.
+   */
+  vpnIpsecLive: {
+    path: 'monitor/vpn/ipsec',
+    results: 'list',
+    maxItems: 500,
+    fields: {
+      name: true,
+      comments: true,
+      rgwy: true,
+      type: true,
+      connection_count: true,
+      creation_time: true,
+      incoming_bytes: true,
+      outgoing_bytes: true,
+      proxyid: {
+        p2name: true,
+        status: true,
+        expire: true,
+        incoming_bytes: true,
+        outgoing_bytes: true,
+        proxy_src: { subnet: true },
+        proxy_dst: { subnet: true },
+        proxysrc: { subnet: true },
+        proxydst: { subnet: true },
+      },
+    },
+  },
+  /** BGP settings, briefly: the AS, router ID, neighbors, neighbor groups and ranges. No neighbor passwords. */
+  bgpConfig: {
+    path: 'cmdb/router/bgp',
+    results: 'object',
+    maxItems: 1,
+    fields: {
+      as: true,
+      'router-id': true,
+      neighbor: { ip: true, 'remote-as': true, interface: true, 'update-source': true, description: true, shutdown: true, bfd: true },
+      'neighbor-group': { name: true, 'remote-as': true, interface: true, 'update-source': true },
+      'neighbor-range': { id: true, prefix: true, 'neighbor-group': true },
+    },
+  },
+  /**
+   * Live BGP neighbors. The FortiOS reference documents the address, local address, remote AS,
+   * admin status, state and type; an uptime or prefix count is kept when a version adds one.
+   */
+  bgpLive: {
+    path: 'monitor/router/bgp/neighbors',
+    results: 'list',
+    maxItems: 1_000,
+    fields: {
+      neighbor_ip: true,
+      local_ip: true,
+      remote_as: true,
+      admin_status: true,
+      state: true,
+      type: true,
+      uptime: true,
+      up_time: true,
+      prefixes_received: true,
+      received_prefixes: true,
+    },
+  },
+  /** SSL-VPN settings, briefly: on or off, port, listening interfaces. No server certificate. */
+  sslVpnConfig: {
+    path: 'cmdb/vpn.ssl/settings',
+    results: 'object',
+    maxItems: 1,
+    fields: { status: true, port: true, 'source-interface': { name: true } },
+  },
+  /** Live SSL-VPN sessions, only to count them: no user names, addresses or times are kept. */
+  sslVpnLive: {
+    path: 'monitor/vpn/ssl',
+    results: 'list',
+    maxItems: 5_000,
+    fields: { index: true },
+  },
   /** Firewall address objects. */
   addresses: {
     path: 'cmdb/firewall/address',

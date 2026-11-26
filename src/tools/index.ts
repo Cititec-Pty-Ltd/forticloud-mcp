@@ -2,11 +2,12 @@ import type { Tool } from '@modelcontextprotocol/sdk/types.js';
 import { NETWORK_SPECS } from './network.js';
 import { READ_SPECS } from './read.js';
 import { ROUTING_SPECS } from './routing.js';
+import { VPN_SPECS } from './vpn.js';
 import { buildTool, runSpec } from './spec.js';
 import type { ToolSpec } from './spec.js';
 import type { CallToolResult } from './types.js';
 
-export const ALL_SPECS: ToolSpec[] = [...READ_SPECS, ...NETWORK_SPECS, ...ROUTING_SPECS];
+export const ALL_SPECS: ToolSpec[] = [...READ_SPECS, ...NETWORK_SPECS, ...ROUTING_SPECS, ...VPN_SPECS];
 
 export const ALL_TOOLS: Tool[] = ALL_SPECS.map(buildTool);
 

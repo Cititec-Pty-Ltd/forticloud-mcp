@@ -59,7 +59,7 @@ export interface Failure {
   retryAfterSeconds?: number;
 }
 
-type Got = { ok: true; read: string; res: FortiosResult } | { ok: false; read: string; fail: Failure; deviceDown?: boolean };
+export type Got = { ok: true; read: string; res: FortiosResult } | { ok: false; read: string; fail: Failure; deviceDown?: boolean };
 
 /** Why a read failed, from its error. */
 function failure(read: string, err: unknown): { fail: Failure; deviceDown: boolean } {
@@ -75,7 +75,7 @@ function failure(read: string, err: unknown): { fail: Failure; deviceDown: boole
   return { fail: { read, reason: 'failed', error }, deviceDown: true };
 }
 
-interface Ctx {
+export interface Ctx {
   api: Api;
   sn: string;
   vdom?: string;
@@ -85,7 +85,7 @@ interface Ctx {
   answered: number;
 }
 
-async function get(ctx: Ctx, endpoint: FortiosEndpointName, read: string): Promise<Got> {
+export async function get(ctx: Ctx, endpoint: FortiosEndpointName, read: string): Promise<Got> {
   if (ctx.rateLimit) {
     const s = ctx.rateLimit.retryAfterSeconds;
     return { ok: false, read, fail: { read, reason: 'rate_limited', error: `not asked: FortiCloud rate-limited an earlier read; try again in ${s} s`, retryAfterSeconds: s } };
@@ -113,7 +113,7 @@ async function get(ctx: Ctx, endpoint: FortiosEndpointName, read: string): Promi
   }
 }
 
-const notTried = (read: string, why: string): Got => ({ ok: false, read, fail: { read, reason: 'not_tried', error: why } });
+export const notTried = (read: string, why: string): Got => ({ ok: false, read, fail: { read, reason: 'not_tried', error: why } });
 
 /** FortiOS before 6.4 keeps SD-WAN in `system virtual-wan-link`. Unknown versions are taken as 6.4 or later. */
 export function isLegacySdwan(version: string | undefined): boolean {
@@ -139,7 +139,7 @@ async function readSdwan(ctx: Ctx): Promise<Got & { legacy?: boolean }> {
 
 const MORE = 'raise max_rows to see them';
 
-interface StaticRoute extends Raw {
+export interface StaticRoute extends Raw {
   linkMonitorExempt?: true;
   seq?: number;
   destination: string;
@@ -155,7 +155,7 @@ interface StaticRoute extends Raw {
   blackhole?: true;
 }
 
-function staticRoute(r: Raw): StaticRoute {
+export function staticRoute(r: Raw): StaticRoute {
   const zones = names(r['sdwan-zone']);
   const viaSdwan = zones.length > 0 || on(r.sdwan) || on(r['virtual-wan-link']);
   return compact({
