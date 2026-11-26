@@ -551,6 +551,32 @@ function selectorPairs(t: Tunnel, f: Facts): { local: Net4; remote: Net4; text: 
   return out;
 }
 
+const containsNet = (a: Net4, b: Net4) => a.prefix <= b.prefix && contains(a, b.ip);
+const halves = (n: Net4): [Net4, Net4] => [
+  { ip: n.ip, prefix: n.prefix + 1 },
+  { ip: (n.ip | (1 << (31 - n.prefix))) >>> 0, prefix: n.prefix + 1 },
+];
+/** Do these selectors together cover all traffic from local to remote? true, false, or undefined when it
+ * would take too many splits to tell. Splits the wider side in halves until each part is inside one
+ * selector or outside all of them. */
+function selectorsCover(sels: { local: Net4; remote: Net4 }[], local: Net4, remote: Net4, budget = { n: 4096 }): boolean | undefined {
+  if (sels.some((y) => containsNet(y.local, local) && containsNet(y.remote, remote))) return true;
+  const touching = sels.filter((y) => overlaps(y.local, local) && overlaps(y.remote, remote));
+  if (!touching.length) return false;
+  if (--budget.n <= 0 || (local.prefix >= 32 && remote.prefix >= 32)) return undefined;
+  const splitLocal = local.prefix < 32 && (local.prefix <= remote.prefix || remote.prefix >= 32);
+  const parts = splitLocal ? halves(local).map((l) => [l, remote] as const) : halves(remote).map((r) => [local, r] as const);
+  let unknown = false;
+  for (const [l, r] of parts) {
+    const c = selectorsCover(touching, l, r, budget);
+    if (c === false) return false;
+    if (c === undefined) unknown = true;
+  }
+  return unknown ? undefined : true;
+}
+/** The narrower of two overlapping networks (their intersection). */
+const narrower = (a: Net4, b: Net4) => (a.prefix >= b.prefix ? a : b);
+
 function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   const p = f.byName.get(primaryName);
   const problems: string[] = [];
@@ -586,11 +612,13 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
     else {
       // Only selectors for subnets the primary routes: a selector with no route carries no traffic to fail over.
       const routed = liveRoutes(p).map((r) => routeNet(r.destination)).filter((n): n is Net4 => !!n);
-      const unmatched = pSel
-        .filter((x) => routed.some((n) => overlaps(n, x.remote)))
-        .filter((x) => !bSel.some((y) => overlaps(x.local, y.local) && overlaps(x.remote, y.remote)))
-        .map((x) => x.text);
-      if (unmatched.length) problems.push(`backup ${b.name} has no phase 2 selector matching the primary's ${[...new Set(unmatched)].join(', ')}: that traffic cannot use the backup`);
+      const unmatched: string[] = [];
+      for (const x of pSel.filter((x) => routed.some((n) => overlaps(n, x.remote)))) {
+        const c = selectorsCover(bSel, x.local, x.remote);
+        if (c === false) unmatched.push(x.text);
+        else if (c === undefined) selectorsUnknown = true;
+      }
+      if (unmatched.length) problems.push(`backup ${b.name}'s phase 2 selectors do not cover all of the primary's ${[...new Set(unmatched)].join(', ')}: that traffic cannot use the backup`);
     }
   }
 
@@ -814,7 +842,35 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
             problems.push(`${dst} is routed via ${routed.join(', ')}, but no tunnel's phase 2 selectors include it: that traffic has no path`);
             continue;
           }
-          if (carriers.length !== 1) continue;
+          if (carriers.length > 1) {
+            // Each carrier's selectors for this destination must be covered by another carrier's, on the
+            // local side too, or traffic from that local subnet has no other tunnel.
+            const dn = routeNet(dst);
+            for (const c of carriers) {
+              const mine = selectorPairs(c, f);
+              if (!mine || !dn) {
+                selUnknown = true;
+                continue;
+              }
+              for (const x of mine.filter((x) => overlaps(x.remote, dn))) {
+                const remote = narrower(x.remote, dn);
+                let covered: boolean | undefined = false;
+                for (const o of carriers) {
+                  if (o === c) continue;
+                  const theirs = selectorPairs(o, f);
+                  const r = theirs ? selectorsCover(theirs, x.local, remote) : undefined;
+                  if (r === true) {
+                    covered = true;
+                    break;
+                  }
+                  if (r === undefined) covered = undefined;
+                }
+                if (covered === undefined) selUnknown = true;
+                else if (!covered) problems.push(`traffic ${x.text} has a path only via ${c.name}: no other tunnel's phase 2 selectors cover it`);
+              }
+            }
+            continue;
+          }
           const t = carriers[0].name;
           // BGP over another tunnel of the site may carry a backup route the static routes do not show.
           if (g.some((o) => o.name !== t && o.bgpNeighbors?.length)) continue;

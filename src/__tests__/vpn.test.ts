@@ -1056,7 +1056,46 @@ describe('forticloud_get_vpn: review fixes', () => {
     setFetchForTests(fn);
     const out = dataOf(await call({ serial: SN }));
     expect(out.pairs[0].healthy).toBe(false);
-    expect(out.pairs[0].problems).toContain('backup to-hq-4g has no phase 2 selector matching the primary\x27s 192.0.2.0/24 -> 203.0.113.0/24: that traffic cannot use the backup');
+    expect(out.pairs[0].problems).toContain('backup to-hq-4g\x27s phase 2 selectors do not cover all of the primary\x27s 192.0.2.0/24 -> 203.0.113.0/24: that traffic cannot use the backup');
     expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+  });
+
+  it('a narrower backup selector (local /25 against the primary /24) does not cover the primary', async () => {
+    const narrow = { ...phase2('to-hq-4g'), 'src-subnet': '192.0.2.0 255.255.255.128' };
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), narrow])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0].healthy).toBe(false);
+    expect(out.pairs[0].problems).toContainEqual(expect.stringMatching(/do not cover all of the primary/));
+  });
+
+  it('two backup selectors that together cover the primary selector are enough', async () => {
+    const lo = { ...phase2('to-hq-4g', '203.0.113.0 255.255.255.0', 'lte-lo'), 'src-subnet': '192.0.2.0 255.255.255.128' };
+    const hi = { ...phase2('to-hq-4g', '203.0.113.0 255.255.255.0', 'lte-hi'), 'src-subnet': '192.0.2.128 255.255.255.128' };
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), lo, hi])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('lte-lo', 'down'), sa('lte-hi', 'down')])])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+  });
+
+  it('route-distance: tunnels with the same remote but different local selectors are flagged', async () => {
+    const otherLocal = { ...phase2('to-hq-4g'), 'src-subnet': '198.51.100.0 255.255.255.0' };
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), otherLocal])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+      })
+    );
+    setFetchForTests(fn);
+    const line = dataOf(await call({ serial: SN })).summary.sites[0];
+    expect(line).toContain('traffic 192.0.2.0/24 -> 203.0.113.0/24 has a path only via to-hq-fibre');
+    expect(line).toContain('traffic 198.51.100.0/24 -> 203.0.113.0/24 has a path only via to-hq-4g');
+    expect(line).not.toMatch(/should work/);
   });
 });
