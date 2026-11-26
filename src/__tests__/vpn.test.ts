@@ -1049,4 +1049,14 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(line).toContain("198.51.100.0/24 is routed via to-hq-fibre, to-hq-4g, but no tunnel's phase 2 selectors include it: that traffic has no path");
     expect(line).not.toMatch(/should work/);
   });
+
+  it('a backup whose selector has a different local subnet is flagged, though the remote matches', async () => {
+    const otherLocal = { ...phase2('to-hq-4g'), 'src-subnet': '198.51.100.0 255.255.255.0' };
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), otherLocal])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0].healthy).toBe(false);
+    expect(out.pairs[0].problems).toContain('backup to-hq-4g has no phase 2 selector matching the primary\x27s 192.0.2.0/24 -> 203.0.113.0/24: that traffic cannot use the backup');
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+  });
 });

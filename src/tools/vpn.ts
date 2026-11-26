@@ -537,6 +537,20 @@ function selectorNets(t: Tunnel, f: Facts): { ip: number; prefix: number }[] | u
   return nets.every((n) => !!n) ? (nets as { ip: number; prefix: number }[]) : undefined;
 }
 
+type Net4 = { ip: number; prefix: number };
+/** A tunnel's configured selectors as local and remote networks, or undefined when they are not all known. */
+function selectorPairs(t: Tunnel, f: Facts): { local: Net4; remote: Net4; text: string }[] | undefined {
+  if (!f.phase2Complete || t.phase2Total !== undefined || !t.phase2?.length) return undefined;
+  const out: { local: Net4; remote: Net4; text: string }[] = [];
+  for (const p of t.phase2) {
+    const local = p.local ? routeNet(p.local) : undefined;
+    const remote = p.remote ? routeNet(p.remote) : undefined;
+    if (!local || !remote) return undefined;
+    out.push({ local, remote, text: `${p.local} -> ${p.remote}` });
+  }
+  return out;
+}
+
 function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   const p = f.byName.get(primaryName);
   const problems: string[] = [];
@@ -564,6 +578,19 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
         })
         .map((r) => r.destination);
       if (outside.length) problems.push(`backup ${b.name}'s phase 2 selectors do not include ${[...new Set(outside)].join(', ')}, which the primary carries: that traffic cannot use the backup`);
+    }
+    // Each primary selector needs a backup selector whose local and remote sides both overlap it.
+    const pSel = selectorPairs(p, f);
+    const bSel = selectorPairs(b, f);
+    if (!pSel || !bSel) selectorsUnknown = true;
+    else {
+      // Only selectors for subnets the primary routes: a selector with no route carries no traffic to fail over.
+      const routed = liveRoutes(p).map((r) => routeNet(r.destination)).filter((n): n is Net4 => !!n);
+      const unmatched = pSel
+        .filter((x) => routed.some((n) => overlaps(n, x.remote)))
+        .filter((x) => !bSel.some((y) => overlaps(x.local, y.local) && overlaps(x.remote, y.remote)))
+        .map((x) => x.text);
+      if (unmatched.length) problems.push(`backup ${b.name} has no phase 2 selector matching the primary's ${[...new Set(unmatched)].join(', ')}: that traffic cannot use the backup`);
     }
   }
 
