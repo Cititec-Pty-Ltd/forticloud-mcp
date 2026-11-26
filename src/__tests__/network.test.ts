@@ -179,7 +179,7 @@ describe('FortiOS proxy allowlists', () => {
     const walk = (shape: Shape) => {
       for (const [k, v] of Object.entries(shape)) {
         names.push(k);
-        if (v !== true) walk(v);
+        if (typeof v === 'object') walk(v);
       }
     };
     for (const e of Object.values(FORTIOS_ENDPOINTS)) walk(e.fields);
