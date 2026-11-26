@@ -437,8 +437,11 @@ describe('forticloud_get_vpn', () => {
     );
     expect(out.tunnels.routesError).toMatchObject({ reason: 'rate_limited' });
     expect(out.bgp.liveError.error).toMatch(/^not asked/);
-    // Routes unknown: no "no route" problem is claimed; the pair state still shows.
-    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+    // Routes unknown: no "no route" problem is claimed; the pair state still shows, but it is not
+    // called healthy and the site does not say "should work".
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle' });
+    expect(out.pairs[0].healthy).toBeUndefined();
+    expect(out.summary.sites[0]).toMatch(/Failover is set up and the tunnels look right now, but the routes could not be read in full/);
     expect(out.summary.caveats).toEqual(expect.arrayContaining([expect.stringMatching(/static routes could not be read \(rate_limited\)/)]));
   });
 
@@ -968,5 +971,28 @@ describe('forticloud_get_vpn: review fixes', () => {
     setFetchForTests(fn);
     const line = dataOf(await call({ serial: SN })).summary.sites[0];
     expect(line).not.toMatch(/has a route only via/);
+  });
+
+  it('route-distance failover with the static routes unreadable does not say "should work"', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+        'cmdb/router/static': json({ status: 'error', http_status: 403 }, 403),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(JSON.stringify(out.summary.sites)).not.toMatch(/should work/);
+  });
+
+  it('a monitor pair with the static routes unreadable is not called healthy', async () => {
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/router/static': json({ status: 'error', http_status: 403 }, 403) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle' });
+    expect(out.pairs[0].healthy).toBeUndefined();
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+    expect(out.summary.sites[0]).toMatch(/the routes could not be read in full/);
   });
 });

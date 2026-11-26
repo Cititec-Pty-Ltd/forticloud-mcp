@@ -518,6 +518,10 @@ function carries(t: Tunnel): string | undefined {
 const DPD_OFF = (t: string, role: string) =>
   `DPD is off on ${role}${t}: a dead tunnel is noticed only when its interface goes down or IKE renegotiates, so failover is slow or never happens`;
 
+/** The routing checks (static routes, SD-WAN, BGP) ran on complete data. */
+const routingKnown = (f: Facts) => f.routesKnown && f.sdwanKnown && f.bgpKnown;
+const ROUTING_UNKNOWN = 'the routes could not be read in full, so whether the tunnels carry the traffic is not known';
+
 function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   const p = f.byName.get(primaryName);
   const problems: string[] = [];
@@ -569,7 +573,8 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
     if (p.status === 'partially up')
       problems.push(`primary ${p.name} is only partly up (${p.phase2Up} of ${p.phase2Count} phase 2 up): the down selectors have no path unless the backup comes up`);
     if (b.status === 'partially up' && shouldActivate) problems.push(`backup ${b.name} is only partly up (${b.phase2Up} of ${b.phase2Count} phase 2 up)`);
-    healthy = problems.length === 0;
+    // No problem found is 'healthy' only when the routing checks ran on complete data.
+    healthy = problems.length ? false : routingKnown(f) ? true : undefined;
   } else if (multi && p && !allKnown) {
     const names = b.backupOf ?? [primaryName];
     const unk = names.filter((_, i) => !monitored[i] || monitored[i]!.status === undefined);
@@ -599,7 +604,8 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
     if (p.status === 'partially up')
       problems.push(`primary ${p.name} is only partly up (${p.phase2Up} of ${p.phase2Count} phase 2 up): the backup stays idle while any of the primary is up, so the down selectors have no path`);
     if (b.status === 'partially up' && !pUp) problems.push(`backup ${b.name} is only partly up (${b.phase2Up} of ${b.phase2Count} phase 2 up)`);
-    healthy = problems.length === 0;
+    // No problem found is 'healthy' only when the routing checks ran on complete data.
+    healthy = problems.length ? false : routingKnown(f) ? true : undefined;
   } else if (primaryOmitted) {
     state = `unknown: ${primaryName} is not in the part of the phase 1 list read (it was cut)`;
   } else if (!p) {
@@ -697,7 +703,11 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
           return `backup ${b.name} ${st} (monitor of ${b.backupOf!.join(', ')}${holdText(b) ? `, ${holdText(b)}` : ''})`;
         }),
       ].join('; ');
-      const ok = ps.every((p) => p.healthy) ? 'Failover should work.' : 'Failover is set up; the live state is not known, so whether it would take over now is not known.';
+      const ok = ps.every((p) => p.healthy)
+        ? 'Failover should work.'
+        : ps.some((p) => p.state.startsWith('unknown'))
+          ? 'Failover is set up; the live state is not known, so whether it would take over now is not known.'
+          : `Failover is set up and the tunnels look right now, but ${ROUTING_UNKNOWN}.`;
       out.push({ tunnels: g.map((t) => t.name), method: 'monitor', line: `${label}: ${desc}${extra ? `; ${extra}` : ''}. ${tail(problems, ok)}`, problems });
       continue;
     }
@@ -744,7 +754,7 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
       for (const t of g) if (t.status === 'down' && up.length) problems.push(`${t.name} is down: the site is reached over ${up.map((u) => u.name).join(', ')}`);
       const desc = g.map((t) => `${t.name} ${stateWord(t)} (${dpdText(t)})`).join('; ');
       const allKnown = g.every((t) => t.status !== undefined);
-      const ok = !f.liveKnown ? 'Failover is by route distance; the live state could not be read.' : !allKnown ? `Failover is by route distance; the live state of ${g.filter((t) => t.status === undefined).map((t) => t.name).join(', ')} is not known, so whether it would take over is not known.` : 'Failover by route distance should work: when a tunnel goes down its routes leave the table and the next one takes over.';
+      const ok = !f.liveKnown ? 'Failover is by route distance; the live state could not be read.' : !allKnown ? `Failover is by route distance; the live state of ${g.filter((t) => t.status === undefined).map((t) => t.name).join(', ')} is not known, so whether it would take over is not known.` : !routingKnown(f) ? `Failover is by route distance, but ${ROUTING_UNKNOWN}.` : 'Failover by route distance should work: when a tunnel goes down its routes leave the table and the next one takes over.';
       out.push({
         tunnels: g.map((t) => t.name),
         method: 'routing',
