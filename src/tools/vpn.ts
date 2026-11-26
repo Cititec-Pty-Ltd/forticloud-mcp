@@ -499,13 +499,25 @@ function routeNet(dst: string): { ip: number; prefix: number } | undefined {
 }
 
 function coveredBy(routes: TunnelRoute[], r: TunnelRoute): boolean {
+  const same = routes.filter((x) => (x.vrf ?? 0) === (r.vrf ?? 0));
+  if (same.some((x) => x.destination === r.destination)) return true;
   const rn = routeNet(r.destination);
-  return routes.some((x) => {
-    if ((x.vrf ?? 0) !== (r.vrf ?? 0)) return false;
-    if (x.destination === r.destination) return true;
-    const xn = routeNet(x.destination);
-    return !!rn && !!xn && xn.prefix <= rn.prefix && contains(xn, rn.ip);
-  });
+  if (!rn) return false;
+  const nets = same.map((x) => routeNet(x.destination)).filter((n): n is { ip: number; prefix: number } => !!n);
+  // Several narrower routes may cover it together (two /25s make a /24): split it in halves until each
+  // part is inside one route or outside all of them. Too many splits to tell counts as covered, so a
+  // large route table never raises a false alarm.
+  const budget = { n: 4096 };
+  const cover = (t: { ip: number; prefix: number }): boolean => {
+    if (nets.some((x) => x.prefix <= t.prefix && contains(x, t.ip))) return true;
+    const touching = nets.filter((x) => (x.prefix <= t.prefix ? contains(x, t.ip) : contains(t, x.ip)));
+    if (!touching.length) return false;
+    if (t.prefix >= 32 || --budget.n <= 0) return true;
+    const lo = { ip: t.ip, prefix: t.prefix + 1 };
+    const hi = { ip: (t.ip | (1 << (31 - t.prefix))) >>> 0, prefix: t.prefix + 1 };
+    return cover(lo) && cover(hi);
+  };
+  return cover(rn);
 }
 
 /** Why this tunnel carries traffic (a route, SD-WAN, BGP or routes it adds itself), or undefined. */

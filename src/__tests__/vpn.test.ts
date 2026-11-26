@@ -1105,4 +1105,22 @@ describe('forticloud_get_vpn: review fixes', () => {
     const out = dataOf(await call({ serial: SN }));
     expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
   });
+
+  it('two narrower backup routes that together cover the primary destination are enough', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15, '203.0.113.0 255.255.255.128'), route(3, 'to-hq-4g', 15, '203.0.113.128 255.255.255.128')])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0]).toMatchObject({ state: 'primary up, backup idle', healthy: true });
+  });
+
+  it('one narrower backup route does not cover the primary destination', async () => {
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15, '203.0.113.0 255.255.255.128')])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0].problems).toContain('backup to-hq-4g has no route to 203.0.113.0/24, which the primary carries');
+  });
 });
