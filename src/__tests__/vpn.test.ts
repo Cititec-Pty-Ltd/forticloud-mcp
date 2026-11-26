@@ -856,4 +856,44 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(out.bgp.neighbors[0]).toMatchObject({ ip: '192.0.2.4', tunnel: 'to-hq-4g' });
     expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/backup to-hq-4g has no route using it/));
   });
+
+  it('a BGP-only backup whose neighbor was cut from the BGP list is not called unrouted', async () => {
+    const others = Array.from({ length: MAX_NESTED }, (_, i) => ({ ip: `198.51.100.${i % 250}`, 'remote-as': '65100', interface: 'wan1' }));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10)])),
+        'cmdb/router/bgp': json(envelope({ as: '65001', 'router-id': '192.0.2.1', neighbor: [...others, { ip: '192.0.2.4', 'remote-as': '65000', interface: 'to-hq-4g' }], 'neighbor-group': [], 'neighbor-range': [] })),
+        'monitor/router/bgp/neighbors': notFound(),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.truncatedReads).toContain('cmdb router/bgp');
+    expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route using it/));
+    expect(out.summary.caveats).toContainEqual(expect.stringMatching(/BGP neighbor list was cut/));
+  });
+
+  it('multi-primary failover onto a partly up backup reports the backup selectors that are down', async () => {
+    const two = { monitor: [{ name: 'to-hq-fibre' }, { name: 'to-hq-nbn' }], 'monitor-min': 1 };
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-nbn'), phase1('to-hq-4g', two)])),
+        'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), phase2('to-hq-nbn'), phase2('to-hq-4g'), phase2('to-hq-4g', '198.51.100.0 255.255.255.0', 'to-hq-4g-voice')])),
+        'monitor/vpn/ipsec': json(
+          envelope([
+            liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'down')]),
+            liveTunnel('to-hq-nbn', [sa('to-hq-nbn-p2', 'up')]),
+            liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up'), sa('to-hq-4g-voice', 'down', '198.51.100.0/255.255.255.0')]),
+          ])
+        ),
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-nbn', 10), route(3, 'to-hq-4g', 15)])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    for (const p of out.pairs) {
+      expect(p.healthy).not.toBe(true);
+      expect(p.problems).toContain('backup to-hq-4g is only partly up (1 of 2 phase 2 up)');
+    }
+  });
 });

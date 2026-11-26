@@ -458,6 +458,8 @@ interface Facts {
   liveKnown: boolean;
   /** The phase 1 list was complete, so a tunnel missing from it is not configured. */
   phase1Complete: boolean;
+  /** BGP neighbors were read completely (or BGP is not on this FortiOS), so a tunnel with none has none. */
+  bgpKnown: boolean;
 }
 
 const stateWord = (t: Tunnel | undefined) =>
@@ -518,8 +520,8 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   const primaryOmitted = !p && !f.phase1Complete;
   if (!p && !primaryOmitted) problems.push(`backup ${b.name} is set to monitor ${primaryName}, which is not configured, so it never takes over from anything`);
   if (p?.dpd?.mode === 'disable') problems.push(DPD_OFF(p.name, 'primary '));
-  if (f.routesKnown && f.sdwanKnown && !carries(b)) problems.push(`backup ${b.name} has no route using it: it will come up but carry no traffic`);
-  if (p && f.routesKnown && f.sdwanKnown && !carries(p)) problems.push(`primary ${p.name} has no route using it`);
+  if (f.routesKnown && f.sdwanKnown && f.bgpKnown && !carries(b)) problems.push(`backup ${b.name} has no route using it: it will come up but carry no traffic`);
+  if (p && f.routesKnown && f.sdwanKnown && f.bgpKnown && !carries(p)) problems.push(`primary ${p.name} has no route using it`);
   if (p && f.routesKnown && !b.sdwanMember && !b.bgpNeighbors?.length && liveRoutes(b).length) {
     // A backup route covers a primary destination when it is in the same VRF and its subnet contains it.
     const missing = liveRoutes(p).filter((r) => !coveredBy(liveRoutes(b), r)).map((r) => r.destination);
@@ -560,6 +562,7 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
     }
     if (p.status === 'partially up')
       problems.push(`primary ${p.name} is only partly up (${p.phase2Up} of ${p.phase2Count} phase 2 up): the down selectors have no path unless the backup comes up`);
+    if (b.status === 'partially up' && shouldActivate) problems.push(`backup ${b.name} is only partly up (${b.phase2Up} of ${b.phase2Count} phase 2 up)`);
     healthy = problems.length === 0;
   } else if (multi && p && !allKnown) {
     const names = b.backupOf ?? [primaryName];
@@ -845,6 +848,12 @@ async function getVpn(args: Raw, api: Api) {
     sdwanKnown: memGot.ok ? !memGot.res.truncated && !memGot.res.nestedCut : memGot.fail.reason === 'not_supported',
     liveKnown: liveGot.ok,
     phase1Complete: p1Got.ok && !p1Got.res.truncated,
+    bgpKnown: (() => {
+      const whole = (g: Got) => g.ok && !g.res.truncated && !g.res.nestedCut;
+      const cfg = bgpGot.ok ? whole(bgpGot) : bgpGot.fail.reason === 'not_supported';
+      const live = bgpLiveGot.ok ? whole(bgpLiveGot) : true;
+      return (cfg || whole(bgpLiveGot)) && live;
+    })(),
   };
   const all = sites(tunnels, facts, bgp.neighbors);
 
@@ -881,6 +890,7 @@ async function getVpn(args: Raw, api: Api) {
   if (staticGot.ok && !facts.routesKnown) caveats.push('The static route list was cut, so "no route uses this tunnel" is not checked.');
   if (memGot.ok && !facts.sdwanKnown) caveats.push('The SD-WAN member list was cut, so "no route uses this tunnel" is not checked.');
   if (!facts.sdwanKnown && !memGot.ok) caveats.push(`SD-WAN membership could not be read (${memGot.fail.reason}), so "no route uses this tunnel" is not checked.`);
+  if ((bgpGot.ok || bgpLiveGot.ok) && !facts.bgpKnown) caveats.push('The BGP neighbor list was cut, so "no route uses this tunnel" is not checked.');
   if (!bgpGot.ok && !bgpLiveGot.ok) caveats.push(`BGP could not be read (${bgpGot.fail.reason}); a tunnel that carries only BGP routes may be reported with no route.`);
   else if (!ifGot.ok) caveats.push(`The tunnel interface addresses could not be read (${ifGot.fail.reason}), so BGP neighbors are matched to tunnels by interface and update-source only.`);
   if (shownSites.some((s) => s.problems.some((p) => /no route/.test(p))))
