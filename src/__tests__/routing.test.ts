@@ -877,3 +877,20 @@ describe('forticloud_get_routing: third review fixes', () => {
     expect(out.summary.caveats).toEqual(expect.arrayContaining([expect.stringMatching(/also learned by bgp/)]));
   });
 });
+
+describe('forticloud_get_routing: fourth review fix', () => {
+  it('a link-monitor on the interface of a BGP default route is not called link-monitor failover', async () => {
+    const { fn } = fakeForticloud(
+      routingRoutes(SN, {
+        ...LINK_MONITOR,
+        'cmdb/router/static': json(envelope([])),
+        'monitor/router/ipv4': json(envelope([{ ...liveDefault('wan1', '198.51.100.1', 20, 0), type: 'bgp' }])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.summary.failover).toBe('unknown');
+    expect(out.summary.text).toMatch(/learned by bgp/);
+    expect(out.routeCandidates.routes[0].monitoredBy).toBeUndefined();
+  });
+});

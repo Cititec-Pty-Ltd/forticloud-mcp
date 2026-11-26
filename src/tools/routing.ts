@@ -510,7 +510,9 @@ export interface Signals {
 
 /** The link monitors that can remove this route: same interface (and gateway, when the monitor names one), the route not exempt, and inside the monitor's own route list when it has one. */
 function monitorsFor(c: Candidate, s: Signals) {
-  if (c.linkMonitorExempt) return [];
+  // update-static-route acts on static routes (configured, or installed as static from DHCP/PPPoE),
+  // never on connected routes or routes a protocol (BGP, OSPF...) learned.
+  if (c.linkMonitorExempt || c.source === 'connected' || c.source === 'other') return [];
   return s.monitors.filter(
     (m) =>
       enabled(m.status) &&
