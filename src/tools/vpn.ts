@@ -453,6 +453,8 @@ interface Facts {
   /** SD-WAN membership could be read (or SD-WAN is not on this FortiOS). */
   sdwanKnown: boolean;
   liveKnown: boolean;
+  /** The phase 1 list was complete, so a tunnel missing from it is not configured. */
+  phase1Complete: boolean;
 }
 
 const stateWord = (t: Tunnel | undefined) =>
@@ -502,7 +504,9 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   const p = f.byName.get(primaryName);
   const problems: string[] = [];
   const hold = holdText(b);
-  if (!p) problems.push(`backup ${b.name} is set to monitor ${primaryName}, which is not configured, so it never takes over from anything`);
+  // Missing from a cut phase 1 list: it may be configured further down.
+  const primaryOmitted = !p && !f.phase1Complete;
+  if (!p && !primaryOmitted) problems.push(`backup ${b.name} is set to monitor ${primaryName}, which is not configured, so it never takes over from anything`);
   if (p?.dpd?.mode === 'disable') problems.push(DPD_OFF(p.name, 'primary '));
   if (f.routesKnown && f.sdwanKnown && !carries(b)) problems.push(`backup ${b.name} has no route using it: it will come up but carry no traffic`);
   if (p && f.routesKnown && f.sdwanKnown && !carries(p)) problems.push(`primary ${p.name} has no route using it`);
@@ -577,6 +581,8 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
       problems.push(`primary ${p.name} is only partly up (${p.phase2Up} of ${p.phase2Count} phase 2 up): the backup stays idle while any of the primary is up, so the down selectors have no path`);
     if (b.status === 'partially up' && !pUp) problems.push(`backup ${b.name} is only partly up (${b.phase2Up} of ${b.phase2Count} phase 2 up)`);
     healthy = problems.length === 0;
+  } else if (primaryOmitted) {
+    state = `unknown: ${primaryName} is not in the part of the phase 1 list read (it was cut)`;
   } else if (!p) {
     state = 'no primary';
     healthy = false;
@@ -584,9 +590,9 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
   return compact({
     primary: primaryName,
     backup: b.name,
-    backupOnlyWhenPrimaryDown: !!p,
+    backupOnlyWhenPrimaryDown: !!p || primaryOmitted,
     holdDown: hold,
-    primaryState: stateWord(p),
+    primaryState: primaryOmitted ? 'not in the part of the phase 1 list read' : stateWord(p),
     backupState,
     state,
     healthy: healthy ?? (problems.length ? false : undefined),
@@ -718,7 +724,8 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
       for (const t of g) if (t.status === 'partially up') problems.push(`${t.name} is only partly up (${t.phase2Up} of ${t.phase2Count} phase 2 up)`);
       for (const t of g) if (t.status === 'down' && up.length) problems.push(`${t.name} is down: the site is reached over ${up.map((u) => u.name).join(', ')}`);
       const desc = g.map((t) => `${t.name} ${stateWord(t)} (${dpdText(t)})`).join('; ');
-      const ok = f.liveKnown ? 'Failover by route distance should work: when a tunnel goes down its routes leave the table and the next one takes over.' : 'Failover is by route distance; the live state could not be read.';
+      const allKnown = g.every((t) => t.status !== undefined);
+      const ok = !f.liveKnown ? 'Failover is by route distance; the live state could not be read.' : !allKnown ? `Failover is by route distance; the live state of ${g.filter((t) => t.status === undefined).map((t) => t.name).join(', ')} is not known, so whether it would take over is not known.` : 'Failover by route distance should work: when a tunnel goes down its routes leave the table and the next one takes over.';
       out.push({
         tunnels: g.map((t) => t.name),
         method: 'routing',
@@ -827,6 +834,7 @@ async function getVpn(args: Raw, api: Api) {
     routesKnown: staticGot.ok && !staticGot.res.truncated && !staticGot.res.nestedCut,
     sdwanKnown: memGot.ok ? !memGot.res.truncated && !memGot.res.nestedCut : memGot.fail.reason === 'not_supported',
     liveKnown: liveGot.ok,
+    phase1Complete: p1Got.ok && !p1Got.res.truncated,
   };
   const all = sites(tunnels, facts, bgp.neighbors);
 

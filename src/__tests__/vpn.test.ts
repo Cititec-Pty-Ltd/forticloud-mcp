@@ -761,4 +761,38 @@ describe('forticloud_get_vpn: review fixes', () => {
       expect(out.pairs[0].problems?.[0]).toMatch(/^backup to-hq-4g is up while only 0 of 2 monitored primaries are down/);
     });
   });
+
+  it('route-distance failover with a tunnel missing from a cut live answer: readiness unknown, not "should work"', async () => {
+    const cap = FORTIOS_ENDPOINTS.vpnIpsecLive.maxItems;
+    const filler = Array.from({ length: cap }, (_, i) => liveTunnel(`other-${i}`, [sa(`other-${i}`, 'up')]));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), ...filler, liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'down')])])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN, tunnel: 'to-hq-4g' }));
+    expect(out.truncatedReads).toContain('monitor vpn/ipsec');
+    expect(out.summary.sites[0]).not.toMatch(/should work/);
+    expect(out.summary.sites[0]).toMatch(/the live state of to-hq-4g is not known, so whether it would take over is not known./);
+  });
+
+  it('a monitored primary beyond a cut phase 1 list is unknown, not "not configured"', async () => {
+    const cap = FORTIOS_ENDPOINTS.vpnPhase1.maxItems;
+    const filler = Array.from({ length: cap - 1 }, (_, i) => phase1(`other-${i}`));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-4g', BACKUP), ...filler, phase1('to-hq-fibre')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'down')])])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN, tunnel: 'to-hq-4g' }));
+    expect(out.truncatedReads).toContain('cmdb vpn.ipsec/phase1-interface');
+    const pair = out.pairs.find((p: any) => p.backup === 'to-hq-4g');
+    expect(pair).toMatchObject({ primary: 'to-hq-fibre', backupOnlyWhenPrimaryDown: true, state: 'unknown: to-hq-fibre is not in the part of the phase 1 list read (it was cut)' });
+    expect(pair.healthy).toBeUndefined();
+    expect(JSON.stringify(pair)).not.toMatch(/not configured/);
+  });
 });
