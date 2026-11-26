@@ -245,7 +245,12 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
       if (l && !dialup) {
         phase2Up = phase2.filter((p) => p.state === 'up').length;
         phase2Count = phase2.filter((p) => p.state !== undefined).length;
-        status = statusOf(phase2Up, phase2Count);
+        // A configured selector the cut live list leaves out may be down: only all-down is certain then.
+        const unknownP2 = phase2.length - phase2Count;
+        if (unknownP2 > 0 && p2Cut && phase2Up > 0) {
+          status = undefined;
+          statusNote = `state unknown: ${phase2Up} phase 2 selector(s) up, ${unknownP2} not in the part of the live list read (it was cut)`;
+        } else status = statusOf(phase2Up, phase2Count);
         liveInfo = compact({
           remoteGateway: addr(l.rgwy),
           incomingBytes: num(l.incoming_bytes),
@@ -772,8 +777,9 @@ async function getVpn(args: Raw, api: Api) {
 
   const facts: Facts = {
     byName,
-    routesKnown: staticGot.ok,
-    sdwanKnown: memGot.ok || memGot.fail.reason === 'not_supported',
+    // A capped answer may have left the routes or members out: absence from it proves nothing.
+    routesKnown: staticGot.ok && !staticGot.res.truncated && !staticGot.res.nestedCut,
+    sdwanKnown: memGot.ok ? !memGot.res.truncated && !memGot.res.nestedCut : memGot.fail.reason === 'not_supported',
     liveKnown: liveGot.ok,
   };
   const all = sites(tunnels, facts, bgp.neighbors);
@@ -808,6 +814,8 @@ async function getVpn(args: Raw, api: Api) {
   const caveats: string[] = [];
   if (!liveGot.ok) caveats.push(`The live tunnel state could not be read (${liveGot.fail.reason}), so whether a tunnel is up, and whether failover would take over now, is not known.`);
   if (!staticGot.ok) caveats.push(`The static routes could not be read (${staticGot.fail.reason}), so "no route uses this tunnel" is not checked.`);
+  if (staticGot.ok && !facts.routesKnown) caveats.push('The static route list was cut, so "no route uses this tunnel" is not checked.');
+  if (memGot.ok && !facts.sdwanKnown) caveats.push('The SD-WAN member list was cut, so "no route uses this tunnel" is not checked.');
   if (!facts.sdwanKnown && !memGot.ok) caveats.push(`SD-WAN membership could not be read (${memGot.fail.reason}), so "no route uses this tunnel" is not checked.`);
   if (!bgpGot.ok && !bgpLiveGot.ok) caveats.push(`BGP could not be read (${bgpGot.fail.reason}); a tunnel that carries only BGP routes may be reported with no route.`);
   else if (!ifGot.ok) caveats.push(`The tunnel interface addresses could not be read (${ifGot.fail.reason}), so BGP neighbors are matched to tunnels by interface and update-source only.`);

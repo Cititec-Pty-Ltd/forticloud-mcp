@@ -626,4 +626,50 @@ describe('forticloud_get_vpn: review fixes', () => {
     expect(line).toMatch(/Problems: 203\.0\.113\.128\/25 has a route only via to-hq-fibre: no other tunnel takes over if it goes down\.$/);
     expect(line).not.toMatch(/should work/);
   });
+
+  it('a cut live phase 2 list keeps the tunnel state unknown when a configured selector is missing from it', async () => {
+    const n = MAX_NESTED + 1;
+    const p2s = Array.from({ length: n }, (_, i) => phase2('to-hq-fibre', '203.0.113.0 255.255.255.0', `fibre-${i}`));
+    const sas = Array.from({ length: n }, (_, i) => sa(`fibre-${i}`, 'up'));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase2-interface': json(envelope([...p2s, phase2('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', sas), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'down')])])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    const fibre = out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-fibre');
+    expect(fibre.status).toBeUndefined();
+    expect(fibre.statusNote).toBe(`state unknown: ${MAX_NESTED} phase 2 selector(s) up, 1 not in the part of the live list read (it was cut)`);
+    expect(out.pairs[0].healthy).not.toBe(true);
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+  });
+
+  it('a cut static route list does not prove a tunnel has no route', async () => {
+    const cap = FORTIOS_ENDPOINTS.staticRoutes.maxItems;
+    const filler = Array.from({ length: cap }, (_, i) => route(100 + i, 'wan1', 10, `10.${(i >> 8) & 255}.${i & 255}.0 255.255.255.0`));
+    const { fn } = fakeForticloud(vpnRoutes(SN, { 'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), ...filler, route(2, 'to-hq-4g', 15)])) }));
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.truncatedReads).toContain('cmdb router/static');
+    expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route using it/));
+    expect(out.summary.caveats).toContainEqual(expect.stringMatching(/static route list was cut/));
+  });
+
+  it('a cut SD-WAN member list does not prove a tunnel has no route', async () => {
+    const cap = FORTIOS_ENDPOINTS.sdwanMembersLive.maxItems;
+    const members = Object.fromEntries(Array.from({ length: cap + 1 }, (_, i) => [`port${i}`, { status: 'up' }]));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10)])),
+        'monitor/virtual-wan/members': json(envelope(members)),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.truncatedReads).toContain('monitor virtual-wan/members');
+    expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route using it/));
+    expect(out.summary.caveats).toContainEqual(expect.stringMatching(/SD-WAN member list was cut/));
+  });
 });
