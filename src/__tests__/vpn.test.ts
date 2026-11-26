@@ -555,3 +555,75 @@ describe('forticloud_get_vpn', () => {
     expect(fos.every((c) => c.url.searchParams.get('vdom') === 'customer1')).toBe(true);
   });
 });
+
+describe('forticloud_get_vpn: review fixes', () => {
+  it('a tunnel missing from a cut live answer has an unknown state, so its pair is not called healthy', async () => {
+    const cap = FORTIOS_ENDPOINTS.vpnIpsecLive.maxItems;
+    const filler = Array.from({ length: cap }, (_, i) => liveTunnel(`other-${i}`, [sa(`other-${i}`, 'up')]));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, { 'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), ...filler, liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])) })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN, tunnel: 'to-hq-4g' }));
+    expect(out.truncatedReads).toEqual(['monitor vpn/ipsec']);
+    const lte = out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-4g');
+    expect(lte.status).toBeUndefined();
+    expect(lte.statusNote).toMatch(/the answer was cut/);
+    expect(lte.phase2[0].state).toBeUndefined();
+    expect(out.pairs[0]).toMatchObject({ state: 'unknown: the live state of to-hq-4g is not known (the live answer was cut)', backupState: 'state unknown' });
+    expect(out.pairs[0].healthy).toBeUndefined();
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+    expect(out.summary.text).toMatch(/^2 IPsec tunnels \(1 up, 0 partially up, 0 down, 1 unknown\)/);
+  });
+
+  it('a shut-down BGP neighbor is listed but does not count as a route over its tunnel', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([])),
+        'cmdb/router/bgp': json(
+          envelope({
+            as: '65001',
+            neighbor: [
+              { ip: '192.0.2.254', 'remote-as': '65000', interface: 'to-hq-fibre' },
+              { ip: '192.0.2.250', 'remote-as': '65000', interface: 'to-hq-4g', shutdown: 'enable' },
+            ],
+          })
+        ),
+        'monitor/router/bgp/neighbors': json(envelope([{ neighbor_ip: '192.0.2.254', admin_status: true, state: 'Established' }])),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    const lte = out.tunnels.tunnels[1];
+    expect(lte.bgpNeighbors).toBeUndefined();
+    expect(lte.bgpNeighborsShutdown).toEqual(['192.0.2.250']);
+    expect(out.bgp.neighbors[1]).toMatchObject({ ip: '192.0.2.250', tunnel: 'to-hq-4g', shutdown: true });
+    expect(out.pairs[0]).toMatchObject({ healthy: false, problems: ['backup to-hq-4g has no route using it: it will come up but carry no traffic'] });
+    expect(out.summary.sites[0]).toMatch(/192\.0\.2\.250 over to-hq-4g shut down/);
+
+    // Admin down in the live state counts the same.
+    const { fn: fn2 } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([])),
+        'cmdb/router/bgp': json(envelope({ neighbor: [{ ip: '192.0.2.254', interface: 'to-hq-fibre' }, { ip: '192.0.2.250', interface: 'to-hq-4g' }] })),
+        'monitor/router/bgp/neighbors': json(envelope([{ neighbor_ip: '192.0.2.254', admin_status: true, state: 'Established' }, { neighbor_ip: '192.0.2.250', admin_status: false, state: 'Idle' }])),
+      })
+    );
+    setFetchForTests(fn2);
+    expect(dataOf(await call({ serial: SN })).tunnels.tunnels[1].bgpNeighborsShutdown).toEqual(['192.0.2.250']);
+  });
+
+  it('route-distance failover checks every subnet has a route over another tunnel', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/vpn.ipsec/phase1-interface': json(envelope([phase1('to-hq-fibre'), phase1('to-hq-4g')])),
+        'monitor/vpn/ipsec': json(envelope([liveTunnel('to-hq-fibre', [sa('to-hq-fibre-p2', 'up')]), liveTunnel('to-hq-4g', [sa('to-hq-4g-p2', 'up')])])),
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10), route(2, 'to-hq-4g', 15), route(3, 'to-hq-fibre', 10, '203.0.113.128 255.255.255.128')])),
+      })
+    );
+    setFetchForTests(fn);
+    const line = dataOf(await call({ serial: SN })).summary.sites[0];
+    expect(line).toMatch(/Problems: 203\.0\.113\.128\/25 has a route only via to-hq-fibre: no other tunnel takes over if it goes down\.$/);
+    expect(line).not.toMatch(/should work/);
+  });
+});

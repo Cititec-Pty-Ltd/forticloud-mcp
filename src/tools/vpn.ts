@@ -1,4 +1,5 @@
 import type { Api } from '../client.js';
+import { MAX_NESTED } from '../fortios.js';
 import { checkSerial, timeIn } from './format.js';
 import { maskOf, parseFortiosNet, parseIpv4, subnetText } from './ip.js';
 import type { Net } from './ip.js';
@@ -120,6 +121,8 @@ export interface Tunnel {
   phase2Note?: string;
   routes?: TunnelRoute[];
   bgpNeighbors?: string[];
+  /** BGP neighbors over this tunnel that are shut down (shutdown, or admin down): listed, but they carry no routes. */
+  bgpNeighborsShutdown?: string[];
 }
 
 const side = (p: Raw, pre: 'src' | 'dst') => {
@@ -190,6 +193,8 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
   const live = new Map<string, Raw>();
   for (const t of liveGot.ok ? liveGot.res.rows : []) if (typeof t.name === 'string') live.set(t.name, t);
   const used = new Set<string>();
+  // A cut answer: a tunnel missing from it may be up, so its state is unknown, not down.
+  const listCut = liveGot.ok && !!liveGot.res.truncated;
 
   const tunnel = (name: string, p1: Raw | undefined): Tunnel => {
     const settings: Partial<Tunnel> = p1 ? phase1Settings(p1) : {};
@@ -197,6 +202,8 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
     if (l) used.add(name);
     const configuredP2 = p2ByP1.get(name) ?? [];
     const liveP2 = list(l?.proxyid);
+    // Its phase 2 list was cut at MAX_NESTED: a selector missing from it may be up.
+    const p2Cut = liveP2.length >= MAX_NESTED;
     const byName = new Map(liveP2.map((p) => [String(p.p2name ?? ''), p]));
     const liveOf = (p: Raw | undefined) =>
       p
@@ -220,8 +227,8 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
         remote: side(p, 'dst'),
         autoNegotiate: text(p['auto-negotiate'], 10),
         keepalive: text(p.keepalive, 10),
-        // A configured selector the live read does not list has not been negotiated.
-        ...(lp ? liveOf(lp) : liveGot.ok ? { state: 'not negotiated' } : {}),
+        // A configured selector the live read does not list has not been negotiated (unless the list was cut).
+        ...(lp ? liveOf(lp) : liveGot.ok && (l ? !p2Cut : !listCut) ? { state: 'not negotiated' } : {}),
       }) as Phase2;
     });
     for (const lp of liveP2) if (!seen.has(String(lp.p2name ?? ''))) phase2.push(compact({ name: text(lp.p2name, 80), ...liveOf(lp) }) as Phase2);
@@ -249,9 +256,11 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
       } else if (dialup) {
         for (const [n] of instances) used.add(n);
         const upPeers = [...instances.map(([, x]) => x), ...(l ? [l] : [])].filter((x) => list(x.proxyid).some((p) => p.status === 'up')).length;
-        status = upPeers ? 'up' : 'down';
-        statusNote = upPeers ? `dial-up: ${plural(upPeers, 'peer')} connected` : 'dial-up: no peer connected';
+        status = upPeers ? 'up' : listCut ? undefined : 'down';
+        statusNote = upPeers ? `dial-up: ${plural(upPeers, 'peer')} connected` : listCut ? 'dial-up: no connected peer in the part of the live list read (the answer was cut)' : 'dial-up: no peer connected';
         liveInfo = compact({ dialupPeers: instances.length, dialupPeersUp: upPeers });
+      } else if (listCut) {
+        statusNote = 'state unknown: not in the part of the live tunnel list read (the answer was cut)';
       } else {
         status = 'down';
         statusNote = 'not in the live tunnel list';
@@ -487,7 +496,10 @@ function analysePair(primaryName: string, b: Tunnel, f: Facts): Pair {
     if (missing.length) problems.push(`backup ${b.name} has no route to ${[...new Set(missing)].join(', ')}, which the primary carries`);
   }
 
-  let state = 'unknown: the live tunnel state could not be read';
+  const unknownOf = [p, b].filter((t): t is Tunnel => !!t && t.status === undefined).map((t) => t.name);
+  let state = f.liveKnown
+    ? `unknown: the live state of ${unknownOf.join(' and ')} is not known (the live answer was cut)`
+    : 'unknown: the live tunnel state could not be read';
   let healthy: boolean | undefined;
   let backupState = stateWord(b);
   if (p && p.status && b.status) {
@@ -546,9 +558,12 @@ function routesText(group: Tunnel[]): string | undefined {
   return `routes ${parts.join(', ')}${byDst.size > 5 ? ` and ${byDst.size - 5} more` : ''}`;
 }
 
+/** A neighbor shut down in the config, or reported admin down: it carries no routes. */
+const isShut = (n: Neighbor) => n.shutdown === true || n.adminStatus === 'down';
+
 const bgpText = (group: Tunnel[], neighbors: Neighbor[]) => {
   const over = neighbors.filter((n) => n.tunnel && group.some((t) => t.name === n.tunnel));
-  return over.length ? `BGP ${over.slice(0, 4).map((n) => `${n.ip} over ${n.tunnel} ${n.state ?? 'state unknown'}`).join(', ')}${over.length > 4 ? ` and ${over.length - 4} more` : ''}` : undefined;
+  return over.length ? `BGP ${over.slice(0, 4).map((n) => `${n.ip} over ${n.tunnel} ${isShut(n) ? 'shut down' : (n.state ?? 'state unknown')}`).join(', ')}${over.length > 4 ? ` and ${over.length - 4} more` : ''}` : undefined;
 };
 
 export type SiteMethod = 'monitor' | 'routing' | 'sdwan' | 'single';
@@ -608,7 +623,7 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
           return `backup ${b.name} ${st} (monitor of ${b.backupOf!.join(', ')}${holdText(b) ? `, ${holdText(b)}` : ''})`;
         }),
       ].join('; ');
-      const ok = ps.every((p) => p.healthy) ? 'Failover should work.' : 'Failover is set up; the live state could not be read, so whether it would take over now is not known.';
+      const ok = ps.every((p) => p.healthy) ? 'Failover should work.' : 'Failover is set up; the live state is not known, so whether it would take over now is not known.';
       out.push({ tunnels: g.map((t) => t.name), method: 'monitor', line: `${label}: ${desc}${extra ? `; ${extra}` : ''}. ${tail(problems, ok)}`, problems });
       continue;
     }
@@ -627,7 +642,28 @@ function sites(tunnels: Tunnel[], f: Facts, neighbors: Neighbor[]): { sites: Sit
       const problems: string[] = [];
       for (const t of g) if (t.dpd?.mode === 'disable') problems.push(DPD_OFF(t.name, ''));
       const up = g.filter((t) => t.status !== undefined && t.status !== 'down');
-      if (f.liveKnown && !up.length) problems.push(`all of ${label} are down: no tunnel to this site`);
+      if (g.every((t) => t.status === 'down')) problems.push(`all of ${label} are down: no tunnel to this site`);
+      // Each subnet needs a route over more than one tunnel, or nothing takes over when its tunnel fails.
+      if (f.routesKnown) {
+        const via = new Map<string, { dst: string; tunnels: Set<string> }>();
+        for (const t of g)
+          for (const r of liveRoutes(t)) {
+            const k = `${r.vrf ?? 0}|${r.destination}`;
+            const e = via.get(k) ?? { dst: r.destination, tunnels: new Set<string>() };
+            e.tunnels.add(t.name);
+            via.set(k, e);
+          }
+        const only = new Map<string, string[]>();
+        for (const { dst, tunnels } of via.values()) {
+          if (tunnels.size !== 1) continue;
+          const [t] = [...tunnels];
+          // BGP over another tunnel of the site may carry a backup route the static routes do not show.
+          if (g.some((o) => o.name !== t && o.bgpNeighbors?.length)) continue;
+          only.set(t, [...(only.get(t) ?? []), dst]);
+        }
+        for (const [t, dsts] of only)
+          problems.push(`${dsts.join(', ')} ${dsts.length === 1 ? 'has' : 'have'} a route only via ${t}: no other tunnel takes over if it goes down`);
+      }
       for (const t of g) if (t.status === 'partially up') problems.push(`${t.name} is only partly up (${t.phase2Up} of ${t.phase2Count} phase 2 up)`);
       for (const t of g) if (t.status === 'down' && up.length) problems.push(`${t.name} is down: the site is reached over ${up.map((u) => u.name).join(', ')}`);
       const desc = g.map((t) => `${t.name} ${stateWord(t)} (${dpdText(t)})`).join('; ');
@@ -729,7 +765,9 @@ async function getVpn(args: Raw, api: Api) {
   const bgp = bgpSection(bgpGot, bgpLiveGot, tunnelNames, nets);
   for (const n of bgp.neighbors) {
     const t = n.tunnel ? byName.get(n.tunnel) : undefined;
-    if (t && n.ip) t.bgpNeighbors = [...(t.bgpNeighbors ?? []), n.ip];
+    if (!t || !n.ip) continue;
+    if (isShut(n)) t.bgpNeighborsShutdown = [...(t.bgpNeighborsShutdown ?? []), n.ip];
+    else t.bgpNeighbors = [...(t.bgpNeighbors ?? []), n.ip];
   }
 
   const facts: Facts = {
@@ -779,7 +817,8 @@ async function getVpn(args: Raw, api: Api) {
 
   const counts = (ts: Tunnel[]) => {
     const by = (s: TunnelStatus) => ts.filter((t) => t.status === s).length;
-    return liveGot.ok ? `${plural(ts.length, 'IPsec tunnel')} (${by('up')} up, ${by('partially up')} partially up, ${by('down')} down)` : plural(ts.length, 'IPsec tunnel');
+    const unknown = ts.filter((t) => t.status === undefined).length;
+    return liveGot.ok ? `${plural(ts.length, 'IPsec tunnel')} (${by('up')} up, ${by('partially up')} partially up, ${by('down')} down${unknown ? `, ${unknown} unknown` : ''})` : plural(ts.length, 'IPsec tunnel');
   };
   const problemCount = shownSites.reduce((n, s) => n + s.problems.length, 0);
   const sitesShown = shownSites.slice(0, MAX_SITES);
