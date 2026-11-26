@@ -185,6 +185,8 @@ function statusOf(up: number, total: number): TunnelStatus {
 }
 
 function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
+  // A cut phase 2 config list may leave out a selector that is not negotiated (in neither list).
+  const p2ConfigCut = p2Got.ok && !!(p2Got.res.truncated || p2Got.res.nestedCut);
   const p2ByP1 = new Map<string, Raw[]>();
   for (const p of p2Got.ok ? p2Got.res.rows : []) {
     const k = String(p.phase1name ?? '');
@@ -250,6 +252,9 @@ function buildTunnels(p1Got: Got, p2Got: Got, liveGot: Got): Tunnel[] {
         if (unknownP2 > 0 && p2Cut) {
           status = undefined;
           statusNote = `state unknown: ${phase2Up} of ${phase2Count} phase 2 selector(s) read are up, ${unknownP2} not in the part of the live list read (it was cut)`;
+        } else if (p2ConfigCut && phase2Up === phase2Count) {
+          status = undefined;
+          statusNote = `state unknown: the ${phase2Up} phase 2 selector(s) read are up, but the phase 2 configuration list was cut, so a selector that is not negotiated may be missing`;
         } else status = statusOf(phase2Up, phase2Count);
         liveInfo = compact({
           remoteGateway: addr(l.rgwy),
@@ -852,7 +857,9 @@ async function getVpn(args: Raw, api: Api) {
       const whole = (g: Got) => g.ok && !g.res.truncated && !g.res.nestedCut;
       const cfg = bgpGot.ok ? whole(bgpGot) : bgpGot.fail.reason === 'not_supported';
       const live = bgpLiveGot.ok ? whole(bgpLiveGot) : true;
-      return (cfg || whole(bgpLiveGot)) && live;
+      // A neighbor with no interface or update-source is matched to a tunnel by the tunnel addresses.
+      const byAddress = bgp.neighbors.some((n) => !n.tunnel && !n.interface && !n.updateSource);
+      return (cfg || whole(bgpLiveGot)) && live && (!byAddress || whole(ifGot));
     })(),
   };
   const all = sites(tunnels, facts, bgp.neighbors);
@@ -890,7 +897,7 @@ async function getVpn(args: Raw, api: Api) {
   if (staticGot.ok && !facts.routesKnown) caveats.push('The static route list was cut, so "no route uses this tunnel" is not checked.');
   if (memGot.ok && !facts.sdwanKnown) caveats.push('The SD-WAN member list was cut, so "no route uses this tunnel" is not checked.');
   if (!facts.sdwanKnown && !memGot.ok) caveats.push(`SD-WAN membership could not be read (${memGot.fail.reason}), so "no route uses this tunnel" is not checked.`);
-  if ((bgpGot.ok || bgpLiveGot.ok) && !facts.bgpKnown) caveats.push('The BGP neighbor list was cut, so "no route uses this tunnel" is not checked.');
+  if ((bgpGot.ok || bgpLiveGot.ok) && !facts.bgpKnown) caveats.push('Not every BGP neighbor could be placed on a tunnel (a BGP list was cut, or the tunnel addresses could not be read in full), so "no route uses this tunnel" is not checked.');
   if (!bgpGot.ok && !bgpLiveGot.ok) caveats.push(`BGP could not be read (${bgpGot.fail.reason}); a tunnel that carries only BGP routes may be reported with no route.`);
   else if (!ifGot.ok) caveats.push(`The tunnel interface addresses could not be read (${ifGot.fail.reason}), so BGP neighbors are matched to tunnels by interface and update-source only.`);
   if (shownSites.some((s) => s.problems.some((p) => /no route/.test(p))))

@@ -870,7 +870,7 @@ describe('forticloud_get_vpn: review fixes', () => {
     const out = dataOf(await call({ serial: SN }));
     expect(out.truncatedReads).toContain('cmdb router/bgp');
     expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route using it/));
-    expect(out.summary.caveats).toContainEqual(expect.stringMatching(/BGP neighbor list was cut/));
+    expect(out.summary.caveats).toContainEqual(expect.stringMatching(/Not every BGP neighbor could be placed on a tunnel/));
   });
 
   it('multi-primary failover onto a partly up backup reports the backup selectors that are down', async () => {
@@ -895,5 +895,36 @@ describe('forticloud_get_vpn: review fixes', () => {
       expect(p.healthy).not.toBe(true);
       expect(p.problems).toContain('backup to-hq-4g is only partly up (1 of 2 phase 2 up)');
     }
+  });
+
+  it('a cut phase 2 configuration list keeps an all-up primary unknown', async () => {
+    const cap = FORTIOS_ENDPOINTS.vpnPhase2.maxItems;
+    const filler = Array.from({ length: cap - 2 }, (_, i) => phase2(`other-${i}`));
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, { 'cmdb/vpn.ipsec/phase2-interface': json(envelope([phase2('to-hq-fibre'), phase2('to-hq-4g'), ...filler, phase2('to-hq-fibre', '198.51.100.0 255.255.255.0', 'to-hq-fibre-voice')])) })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN, tunnel: 'to-hq-fibre' }));
+    expect(out.truncatedReads).toContain('cmdb vpn.ipsec/phase2-interface');
+    const fibre = out.tunnels.tunnels.find((t: any) => t.name === 'to-hq-fibre');
+    expect(fibre.status).toBeUndefined();
+    expect(fibre.statusNote).toMatch(/phase 2 configuration list was cut/);
+    expect(out.pairs[0].healthy).not.toBe(true);
+    expect(out.summary.sites[0]).not.toMatch(/Failover should work/);
+  });
+
+  it('BGP neighbors matched only by address are not called absent when the tunnel addresses cannot be read', async () => {
+    const { fn } = fakeForticloud(
+      vpnRoutes(SN, {
+        'cmdb/router/static': json(envelope([route(1, 'to-hq-fibre', 10)])),
+        'cmdb/system/interface': json({ status: 'error', http_status: 403 }, 403),
+        'cmdb/router/bgp': json(envelope({ as: '65001', 'router-id': '192.0.2.1', neighbor: [{ ip: '192.0.2.4', 'remote-as': '65000' }], 'neighbor-group': [], 'neighbor-range': [] })),
+        'monitor/router/bgp/neighbors': notFound(),
+      })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.pairs[0].problems ?? []).not.toContainEqual(expect.stringMatching(/has no route using it/));
+    expect(out.summary.caveats).toContainEqual(expect.stringMatching(/Not every BGP neighbor could be placed on a tunnel/));
   });
 });
