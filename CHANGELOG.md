@@ -4,6 +4,32 @@ Releases are cut by semantic-release from the commit messages on `main` (the
 "Cititec release" workflow); it adds an entry above this line for each release
 and publishes the image to `ghcr.io/cititec-pty-ltd/forticloud-mcp`.
 
+## 1.4.0
+
+A read-only tool that shows how a FortiGate's management access is exposed.
+
+- 1 new tool (17 in all): `forticloud_get_admin_access`, for one FortiGate by
+  serial (and VDOM). `summary.internetManagement` says per WAN-facing
+  interface (role wan or a public address) whether an admin sign-in is
+  reachable from the internet: yes, restricted (trusted hosts on every
+  account that can sign in; local-in policies never make it restricted), no,
+  or unknown when a read it depends on failed or was cut, or when a local-in
+  deny policy may apply and needs a check by hand. Each entry shows the
+  addresses with their services and ports, the accounts with their trusted
+  hosts ("any" when none) and any local-in candidates. Also the
+  interfaces with their allowaccess, the admin ports, telnet, redirect,
+  timeout and lockout settings, administrators and REST API users with their
+  trusted hosts and two-factor, local-in policies with address names
+  resolved, and SNMP communities (by id, never the community string) and v3
+  users (never their keys).
+- 7 FortiOS reads, 8 when a local-in policy names an address object. Each
+  read reports on its own; a refused read gives its HTTP status.
+- 7 new FortiOS endpoints on the allowlist (`system/global` admin fields,
+  interfaces with allowaccess, `system/admin`, `system/api-user`,
+  `firewall/local-in-policy`, `system.snmp/community`, `system.snmp/user`).
+  Passwords, password hashes, SSH keys, FortiToken serials, API keys, SNMP
+  community names and SNMP v3 keys are never on a list.
+
 ## 1.3.1
 
 - `forticloud_get_vpn`: a backup tunnel with BGP neighbors no longer skips the

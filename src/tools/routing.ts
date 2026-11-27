@@ -59,20 +59,20 @@ export interface Failure {
   retryAfterSeconds?: number;
 }
 
-export type Got = { ok: true; read: string; res: FortiosResult } | { ok: false; read: string; fail: Failure; deviceDown?: boolean };
+export type Got = { ok: true; read: string; res: FortiosResult } | { ok: false; read: string; fail: Failure; deviceDown?: boolean; httpStatus?: number };
 
 /** Why a read failed, from its error. */
-function failure(read: string, err: unknown): { fail: Failure; deviceDown: boolean } {
+function failure(read: string, err: unknown): { fail: Failure; deviceDown: boolean; httpStatus?: number } {
   const error = clean((err as Error)?.message, 300) ?? 'failed';
   if (err instanceof ForticloudRateLimitError) {
     return { fail: { read, reason: 'rate_limited', error, retryAfterSeconds: err.retryAfterSeconds }, deviceDown: false };
   }
   // A portal-level refusal (the token, or FortiGate Cloud itself) stops every read; a FortiOS one is this endpoint only.
-  if (err instanceof ForticloudAuthError) return { fail: { read, reason: 'permission_denied', error }, deviceDown: true };
+  if (err instanceof ForticloudAuthError) return { fail: { read, reason: 'permission_denied', error }, deviceDown: true, httpStatus: err.httpStatus };
   const status = err instanceof ForticloudApiError ? err.httpStatus : undefined;
-  if (status === 401 || status === 403) return { fail: { read, reason: 'permission_denied', error }, deviceDown: false };
-  if (status === 404 || status === 405 || status === 501) return { fail: { read, reason: 'not_supported', error }, deviceDown: false };
-  return { fail: { read, reason: 'failed', error }, deviceDown: true };
+  if (status === 401 || status === 403) return { fail: { read, reason: 'permission_denied', error }, deviceDown: false, httpStatus: status };
+  if (status === 404 || status === 405 || status === 501) return { fail: { read, reason: 'not_supported', error }, deviceDown: false, httpStatus: status };
+  return { fail: { read, reason: 'failed', error }, deviceDown: true, httpStatus: status };
 }
 
 export interface Ctx {

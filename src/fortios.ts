@@ -568,6 +568,153 @@ export const FORTIOS_ENDPOINTS = {
     maxItems: 5_000,
     fields: { index: true },
   },
+  /**
+   * Management access settings from `system global` (forticloud_get_admin_access): the admin
+   * ports, telnet, HTTP to HTTPS redirect, idle timeout, lockout and the maintainer account.
+   * Nothing else from `system global` is kept.
+   */
+  adminGlobal: {
+    path: 'cmdb/system/global',
+    results: 'object',
+    maxItems: 1,
+    fields: {
+      'admin-sport': true,
+      'admin-port': true,
+      'admin-ssh-port': true,
+      'admin-telnet': true,
+      'admin-telnet-port': true,
+      'admin-https-redirect': true,
+      admintimeout: true,
+      'admin-lockout-threshold': true,
+      'admin-lockout-duration': true,
+      'admin-maintainer': true,
+    },
+  },
+  /** Interfaces with what they allow to the FortiGate itself (allowaccess), IPv4 secondary and IPv6 included. */
+  adminInterfaces: {
+    path: 'cmdb/system/interface',
+    results: 'list',
+    maxItems: 500,
+    fields: {
+      name: true,
+      vdom: true,
+      type: true,
+      role: true,
+      mode: true,
+      ip: true,
+      status: true,
+      alias: true,
+      allowaccess: true,
+      'dedicated-to': true,
+      secondaryip: { id: true, ip: true, allowaccess: true },
+      ipv6: { 'ip6-mode': true, 'ip6-address': true, 'ip6-allowaccess': true },
+    },
+  },
+  /**
+   * Administrators: profile, VDOMs, trusted hosts, two-factor, wildcard and remote group. Never the
+   * password or its hash, SSH public keys, the FortiToken serial or any other credential field.
+   */
+  admins: {
+    path: 'cmdb/system/admin',
+    results: 'list',
+    maxItems: 500,
+    fields: {
+      name: true,
+      accprofile: true,
+      vdom: { name: true },
+      trusthost1: true,
+      trusthost2: true,
+      trusthost3: true,
+      trusthost4: true,
+      trusthost5: true,
+      trusthost6: true,
+      trusthost7: true,
+      trusthost8: true,
+      trusthost9: true,
+      trusthost10: true,
+      'ip6-trusthost1': true,
+      'ip6-trusthost2': true,
+      'ip6-trusthost3': true,
+      'ip6-trusthost4': true,
+      'ip6-trusthost5': true,
+      'ip6-trusthost6': true,
+      'ip6-trusthost7': true,
+      'ip6-trusthost8': true,
+      'ip6-trusthost9': true,
+      'ip6-trusthost10': true,
+      'two-factor': true,
+      wildcard: true,
+      'remote-group': true,
+    },
+  },
+  /** REST API administrators: profile and trusted hosts. Never the API key. */
+  apiUsers: {
+    path: 'cmdb/system/api-user',
+    results: 'list',
+    maxItems: 200,
+    fields: {
+      name: true,
+      accprofile: true,
+      vdom: { name: true },
+      // 7.4 reference: ipv4-trusthost / ipv6-trusthost; ipv4-trustip / ipv6-trustip is read too, in case a version uses it.
+      trusthost: { id: true, type: true, 'ipv4-trusthost': true, 'ipv6-trusthost': true, 'ipv4-trustip': true, 'ipv6-trustip': true },
+    },
+  },
+  /** Local-in policies (traffic to the FortiGate itself). */
+  localIn: {
+    path: 'cmdb/firewall/local-in-policy',
+    results: 'list',
+    maxItems: 1_000,
+    fields: {
+      policyid: true,
+      intf: { name: true },
+      srcaddr: { name: true },
+      'srcaddr-negate': true,
+      dstaddr: { name: true },
+      'dstaddr-negate': true,
+      service: { name: true },
+      'service-negate': true,
+      action: true,
+      schedule: true,
+      status: true,
+      comments: true,
+    },
+  },
+  /**
+   * SNMP v1/v2c communities: which hosts may poll or get traps, and what is on. Never `name`:
+   * the community name is the community string (the shared secret).
+   */
+  snmpCommunities: {
+    path: 'cmdb/system.snmp/community',
+    results: 'list',
+    maxItems: 100,
+    fields: {
+      id: true,
+      status: true,
+      'query-v1-status': true,
+      'query-v2c-status': true,
+      'trap-v1-status': true,
+      'trap-v2c-status': true,
+      hosts: { id: true, ip: true, interface: true, 'host-type': true },
+      hosts6: { id: true, ipv6: true, interface: true, 'host-type': true },
+    },
+  },
+  /** SNMP v3 users: name, security level, queries and trap hosts. Never the authentication or privacy password or protocol. */
+  snmpUsers: {
+    path: 'cmdb/system.snmp/user',
+    results: 'list',
+    maxItems: 100,
+    fields: {
+      name: true,
+      status: true,
+      'security-level': true,
+      queries: true,
+      'query-port': true,
+      'trap-status': true,
+      'notify-hosts': true,
+      'notify-hosts6': true,
+    },
+  },
   /** Firewall address objects. */
   addresses: {
     path: 'cmdb/firewall/address',
