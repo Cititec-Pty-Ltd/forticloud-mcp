@@ -132,7 +132,13 @@ describe('forticloud_get_admin_access', () => {
     expect(fortiosCalls(calls)).toHaveLength(7);
     expect(out.complete).toBeUndefined();
     expect(wan1(out)).toMatchObject({ wanFacing: 'role wan', services: ['https (port 8443)', 'ssh'], internetManagement: 'yes' });
-    expect(wan1(out).reason).toMatch(/admin has no trusted host, and no local-in policy denies it/);
+    expect(wan1(out).reason).toBe("HTTPS (8443) and SSH (22) on 198.51.100.2 open to any address for admin 'admin' (no trusted host); 'example-api' limited to 192.0.2.10/32; no local-in deny policy could apply");
+    expect(wan1(out).addresses).toEqual(['198.51.100.2/30: https (8443), ssh (22)']);
+    expect(wan1(out).allowedFrom).toEqual([
+      { account: 'admin', type: 'admin', trustedHosts: ['any'], ipv6TrustedHosts: ['any'] },
+      { account: 'example-api', type: 'api-user', trustedHosts: ['192.0.2.10/32'], ipv6TrustedHosts: ['any'] },
+    ]);
+    expect(wan1(out).localInCandidates).toBeUndefined();
     // wan2 allows only ping; the LAN interface is not WAN-facing.
     expect(out.summary.internetManagement.find((e: any) => e.interface === 'wan2')).toMatchObject({ internetManagement: 'no' });
     expect(out.summary.internetManagement.map((e: any) => e.interface)).toEqual(['wan1', 'wan2']);
@@ -174,7 +180,12 @@ describe('forticloud_get_admin_access', () => {
     setFetchForTests(fn);
     const out = dataOf(await call({ serial: SN }));
     expect(wan1(out).internetManagement).toBe('restricted');
-    expect(wan1(out).reason).toBe('https (port 8443), ssh allowed, but every administrator and REST API user has trusted hosts: 203.0.113.0/24, 192.0.2.0/25, 192.0.2.10/32');
+    expect(wan1(out).reason).toBe("HTTPS (8443) and SSH (22) on 198.51.100.2 only from trusted hosts: 'admin' limited to 203.0.113.0/24, 'example-tech' limited to 192.0.2.0/25, 'example-api' limited to 192.0.2.10/32");
+    expect(wan1(out).allowedFrom.map((a: any) => [a.account, a.trustedHosts])).toEqual([
+      ['admin', ['203.0.113.0/24']],
+      ['example-tech', ['192.0.2.0/25']],
+      ['example-api', ['192.0.2.10/32']],
+    ]);
     expect(out.administrators.noTrustedHost).toEqual([]);
   });
 
@@ -184,33 +195,102 @@ describe('forticloud_get_admin_access', () => {
     expect(wan1(dataOf(await call({ serial: SN }))).internetManagement).toBe('yes');
   });
 
-  it('a local-in deny from everywhere restricts it, naming the sources let in first', async () => {
+  const policy = (id: number, action: string, src = 'all', extra: Record<string, unknown> = {}) => ({
+    policyid: id,
+    intf: [{ name: 'wan1' }],
+    srcaddr: [{ name: src }],
+    dstaddr: [{ name: 'all' }],
+    service: [{ name: 'ALL' }],
+    action,
+    schedule: 'always',
+    status: 'enable',
+    ...extra,
+  });
+  const MAY = /may restrict this; verify the policy order, schedules and address objects$/;
+
+  it('a local-in deny with an open admin is unknown, never restricted; the policies still show', async () => {
     const { fn, calls } = fakeForticloud(
       routes({
-        'cmdb/firewall/local-in-policy': json(
-          envelope([
-            { policyid: 1, intf: [{ name: 'wan1' }], srcaddr: [{ name: 'mgmt-hosts' }], dstaddr: [{ name: 'all' }], service: [{ name: 'ALL' }], action: 'accept', schedule: 'always', status: 'enable' },
-            { policyid: 2, intf: [{ name: 'wan1' }], srcaddr: [{ name: 'all' }], dstaddr: [{ name: 'all' }], service: [{ name: 'ALL' }], action: 'deny', schedule: 'always', status: 'enable' },
-          ])
-        ),
+        'cmdb/firewall/local-in-policy': json(envelope([policy(1, 'accept', 'mgmt-hosts'), policy(2, 'deny')])),
         'cmdb/firewall/address': json(envelope([{ name: 'mgmt-hosts', type: 'ipmask', subnet: '203.0.113.0 255.255.255.0' }])),
       })
     );
     setFetchForTests(fn);
     const out = dataOf(await call({ serial: SN }));
     expect(fortiosCalls(calls)).toHaveLength(8);
-    expect(wan1(out)).toMatchObject({ internetManagement: 'restricted' });
-    expect(wan1(out).reason).toBe('https (port 8443), ssh allowed, but local-in policy 2 denies IPv4 sign-ins from everywhere except mgmt-hosts (203.0.113.0/24)');
+    expect(wan1(out).internetManagement).toBe('unknown');
+    expect(wan1(out).reason).toBe("HTTPS (8443) and SSH (22) on 198.51.100.2 open to any address for admin 'admin' (no trusted host); 'example-api' limited to 192.0.2.10/32; but local-in policy 2 may restrict this; verify the policy order, schedules and address objects");
+    expect(wan1(out).localInCandidates).toEqual([{ id: 2, action: 'deny', sources: ['all'], destinations: ['all'], services: ['ALL'], schedule: 'always', status: 'enable' }]);
+    expect(wan1(out).allowedFrom[0]).toMatchObject({ account: 'admin', trustedHosts: ['any'] });
     expect(out.localInPolicies.policies[0]).toMatchObject({ id: 1, interfaces: ['wan1'], sources: ['mgmt-hosts (203.0.113.0/24)'], action: 'accept' });
   });
 
-  const denyAll = (id: number, dst = 'all') => ({ policyid: id, intf: [{ name: 'wan1' }], srcaddr: [{ name: 'all' }], dstaddr: [{ name: dst }], service: [{ name: 'ALL' }], action: 'deny', schedule: 'always', status: 'enable' });
+  it('a local-in deny with every admin on trusted hosts: restricted by the trusted hosts', async () => {
+    const { fn } = fakeForticloud(
+      routes({
+        'cmdb/system/admin': json(envelope([admin('admin', ['203.0.113.0 255.255.255.0'])])),
+        'cmdb/firewall/local-in-policy': json(envelope([policy(1, 'deny')])),
+      })
+    );
+    setFetchForTests(fn);
+    const e = wan1(dataOf(await call({ serial: SN })));
+    expect(e.internetManagement).toBe('restricted');
+    expect(e.reason).toMatch(/only from trusted hosts: 'admin' limited to 203.0.113.0\/24/);
+  });
 
-  it('an earlier local-in accept from all leaves it open, whatever deny follows', async () => {
+  it('a scheduled accept from all before a deny: unknown, not restricted', async () => {
+    const { fn } = fakeForticloud(routes({ 'cmdb/firewall/local-in-policy': json(envelope([policy(1, 'accept', 'all', { schedule: 'office-hours' }), policy(2, 'deny')])) }));
+    setFetchForTests(fn);
+    const e = wan1(dataOf(await call({ serial: SN })));
+    expect(e.internetManagement).toBe('unknown');
+    expect(e.reason).toMatch(MAY);
+  });
+
+  it('system/global unreadable (404) with a deny of HTTPS: unknown, not restricted', async () => {
+    const { fn } = fakeForticloud(
+      routes({ 'cmdb/system/global': json({ status: 'error', http_status: 404 }, 404), 'cmdb/firewall/local-in-policy': json(envelope([policy(1, 'deny', 'all', { service: [{ name: 'HTTPS' }, { name: 'SSH' }] })])) })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(out.adminSettings).toMatchObject({ reason: 'not_supported', httpStatus: 404 });
+    expect(wan1(out)).toMatchObject({ services: ['https', 'ssh'], internetManagement: 'unknown', addresses: ['198.51.100.2/30: https (port unknown), ssh (port unknown)'] });
+    expect(wan1(out).reason).toMatch(MAY);
+  });
+
+  it('an earlier accept from an address object that is 0.0.0.0/0: unknown, not restricted', async () => {
+    const { fn } = fakeForticloud(
+      routes({
+        'cmdb/firewall/local-in-policy': json(envelope([policy(1, 'accept', 'everyone'), policy(2, 'deny')])),
+        'cmdb/firewall/address': json(envelope([{ name: 'everyone', type: 'ipmask', subnet: '0.0.0.0 0.0.0.0' }])),
+      })
+    );
+    setFetchForTests(fn);
+    expect(wan1(dataOf(await call({ serial: SN }))).internetManagement).toBe('unknown');
+  });
+
+  it('a deny to the primary address only, https on a secondary: unknown, not restricted', async () => {
+    const { fn } = fakeForticloud(
+      routes({
+        'cmdb/system/interface': json(
+          envelope([{ name: 'wan1', role: 'wan', ip: '198.51.100.2 255.255.255.252', allowaccess: 'ping', secondaryip: [{ id: 1, ip: '198.51.100.6 255.255.255.252', allowaccess: 'https' }] }])
+        ),
+        'cmdb/firewall/local-in-policy': json(envelope([policy(1, 'deny', 'all', { dstaddr: [{ name: 'wan1-primary' }] })])),
+        'cmdb/firewall/address': json(envelope([{ name: 'wan1-primary', type: 'ipmask', subnet: '198.51.100.2 255.255.255.255' }])),
+      })
+    );
+    setFetchForTests(fn);
+    expect(wan1(dataOf(await call({ serial: SN }))).internetManagement).toBe('unknown');
+  });
+
+  it('a deny that cannot apply (another interface, another sign-in service, disabled) leaves it yes', async () => {
     const { fn } = fakeForticloud(
       routes({
         'cmdb/firewall/local-in-policy': json(
-          envelope([{ policyid: 1, intf: [{ name: 'wan1' }], srcaddr: [{ name: 'all' }], dstaddr: [{ name: 'all' }], service: [{ name: 'HTTPS' }, { name: 'SSH' }], action: 'accept', schedule: 'always', status: 'enable' }, denyAll(2)])
+          envelope([
+            policy(1, 'deny', 'all', { intf: [{ name: 'internal' }] }),
+            policy(2, 'deny', 'all', { service: [{ name: 'TELNET' }] }),
+            policy(3, 'deny', 'all', { status: 'disable' }),
+          ])
         ),
       })
     );
@@ -218,59 +298,21 @@ describe('forticloud_get_admin_access', () => {
     expect(wan1(dataOf(await call({ serial: SN }))).internetManagement).toBe('yes');
   });
 
-  it('an IPv4 local-in deny does not restrict IPv6 sign-ins', async () => {
+  it('an IPv4 local-in deny does not affect an open IPv6 sign-in', async () => {
     const { fn } = fakeForticloud(
       routes({
         'cmdb/system/interface': json(
           envelope([{ name: 'wan1', role: 'wan', ip: '198.51.100.2 255.255.255.252', allowaccess: 'https', ipv6: { 'ip6-address': '2001:db8::2/64', 'ip6-allowaccess': 'https' } }])
         ),
         'cmdb/system/admin': json(envelope([admin('admin', ['203.0.113.0 255.255.255.0'])])),
-        'cmdb/firewall/local-in-policy': json(envelope([denyAll(1)])),
+        'cmdb/firewall/local-in-policy': json(envelope([policy(1, 'deny')])),
       })
     );
     setFetchForTests(fn);
     const e = wan1(dataOf(await call({ serial: SN })));
     expect(e.internetManagement).toBe('yes');
-    expect(e.reason).toBe('https (port 8443) allowed; local-in policy 1 denies IPv4 sign-ins from everywhere; on IPv6 admin, example-api (REST API) have no trusted host (IPv6; IPv6 local-in policies are not read)');
-  });
-
-  it('a local-in deny to the primary address only does not cover a secondary address with https', async () => {
-    const iface = json(
-      envelope([{ name: 'wan1', role: 'wan', ip: '198.51.100.2 255.255.255.252', allowaccess: 'ping', secondaryip: [{ id: 1, ip: '198.51.100.6 255.255.255.252', allowaccess: 'https' }] }])
-    );
-    const { fn } = fakeForticloud(
-      routes({
-        'cmdb/system/interface': iface,
-        'cmdb/firewall/local-in-policy': json(envelope([denyAll(1, 'wan1-primary')])),
-        'cmdb/firewall/address': json(envelope([{ name: 'wan1-primary', type: 'ipmask', subnet: '198.51.100.2 255.255.255.255' }])),
-      })
-    );
-    setFetchForTests(fn);
-    expect(wan1(dataOf(await call({ serial: SN }))).internetManagement).toBe('yes');
-
-    // A deny to both addresses restricts it.
-    const { fn: fn2 } = fakeForticloud(
-      routes({
-        'cmdb/system/interface': iface,
-        'cmdb/firewall/local-in-policy': json(envelope([denyAll(1, 'wan1-block')])),
-        'cmdb/firewall/address': json(envelope([{ name: 'wan1-block', type: 'ipmask', subnet: '198.51.100.0 255.255.255.248' }])),
-      })
-    );
-    setFetchForTests(fn2);
-    expect(wan1(dataOf(await call({ serial: SN }))).internetManagement).toBe('restricted');
-  });
-
-  it('a local-in deny for one source only does not restrict it', async () => {
-    const { fn } = fakeForticloud(
-      routes({
-        'cmdb/firewall/local-in-policy': json(
-          envelope([{ policyid: 1, intf: [{ name: 'wan1' }], srcaddr: [{ name: 'bad-host' }], dstaddr: [{ name: 'all' }], service: [{ name: 'ALL' }], action: 'deny', schedule: 'always', status: 'enable' }])
-        ),
-        'cmdb/firewall/address': json(envelope([{ name: 'bad-host', type: 'ipmask', subnet: '198.51.100.99 255.255.255.255' }])),
-      })
-    );
-    setFetchForTests(fn);
-    expect(wan1(dataOf(await call({ serial: SN }))).internetManagement).toBe('yes');
+    expect(e.reason).toBe("HTTPS (8443) on 198.51.100.2 and 2001:db8::2 open to any IPv6 address for admin 'admin', api-user 'example-api' (no IPv6 trusted host); 'admin' limited to 203.0.113.0/24, 'example-api' limited to 192.0.2.10/32; IPv6 local-in policies are not read");
+    expect(e.addresses).toEqual(['198.51.100.2/30: https (8443)', '2001:db8::2/64: https (8443)']);
   });
 
   it('a 403 on the administrators makes the verdict unknown and names the HTTP status; the rest still shows', async () => {

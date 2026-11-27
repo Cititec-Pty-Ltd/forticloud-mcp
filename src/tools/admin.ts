@@ -113,10 +113,16 @@ function buildInterfaces(rows: Raw[], telnetOff: boolean): Iface[] {
               : undefined;
     const other = [...new Set([...all4, ...all6].filter((w) => !isLogin(w)))];
     const v6login = login(all6);
-    // Which IPv4 address opens which sign-in service (undefined ip: none set, as with DHCP or PPPoE).
-    const where = [
-      { ip: v4?.ip, services: login(words(r.allowaccess)) },
-      ...sec.map((s) => ({ ip: parseFortiosNet(s.ip)?.ip, services: login(words(s.allowaccess)) })),
+    // Each address with the sign-in services it allows (an address left out of the configuration, as
+    // with DHCP or PPPoE, is shown by the interface name).
+    const ifName = text(r.name, 40) ?? '';
+    const exposed = [
+      { address: v4 ? ipText(v4) : `${ifName} (address not in the configuration)`, services: login(words(r.allowaccess)) },
+      ...sec.map((x) => {
+        const n = parseFortiosNet(x.ip);
+        return { address: n ? ipText(n) : `${ifName} secondary address`, services: login(words(x.allowaccess)) };
+      }),
+      { address: v6addr && v6addr !== '::/0' ? v6addr : `${ifName} (IPv6 address not in the configuration)`, services: v6login },
     ].filter((a) => a.services.length);
     const out = compact({
       name: text(r.name, 40) ?? '',
@@ -132,12 +138,12 @@ function buildInterfaces(rows: Raw[], telnetOff: boolean): Iface[] {
       other: other.length ? other : undefined,
       wanFacing,
     }) as Iface;
-    ADDRESSES.set(out, where);
+    EXPOSED.set(out, exposed);
     return out;
   });
 }
-/** Per interface, its IPv4 addresses with the sign-in services each allows (kept out of the result). */
-const ADDRESSES = new WeakMap<Iface, { ip?: number; services: Login[] }[]>();
+/** Per interface, its addresses with the sign-in services each allows (for the verdict rows only). */
+const EXPOSED = new WeakMap<Iface, { address: string; services: Login[] }[]>();
 const ipText = (n: Net) => {
   const ip = [n.ip >>> 24, (n.ip >>> 16) & 255, (n.ip >>> 8) & 255, n.ip & 255].join('.');
   return `${ip}/${n.prefix}`;
@@ -237,7 +243,6 @@ function localInOf(r: Raw): LocalIn {
 }
 
 const ANY = new Set(['all', 'any']);
-const isAll = (xs: string[]) => xs.some((x) => ANY.has(x.toLowerCase()));
 
 /** An address object as text ("10.0.0.0/24", "a-b", an FQDN), for local-in sources. */
 function addressText(r: Raw): string | undefined {
@@ -248,70 +253,21 @@ function addressText(r: Raw): string | undefined {
 }
 
 /**
- * Whether the (IPv4) local-in policies stop sign-ins to this interface from the internet: for every
- * IPv4 address and sign-in service it allows, an enabled, always-on deny on this interface (or any)
- * to that address, from everywhere (or from everywhere except a negated list), with no earlier accept
- * that lets everyone in. Returns the policy ids and who is still let in, or undefined.
+ * The enabled local-in deny policies that might apply to sign-ins on this interface: on this interface
+ * (or any, or none named), and with a service that could be one of the sign-in services allowed (ALL,
+ * a custom service, a negated list, or that service's own object). Schedules, destinations, sources and
+ * policy order are not judged: a deny listed here only means "check it by hand", never "restricted".
  */
-function localInLimits(
-  iface: Iface,
-  policies: LocalIn[],
-  addresses: Map<string, { text?: string; net?: Net }> | undefined,
-  ports: Record<Login, number | undefined>
-): { ids: number[]; allowed: string[] } | undefined {
-  const where = ADDRESSES.get(iface) ?? [];
-  const live = policies.filter((p) => p.status !== 'disable' && (!p.schedule || p.schedule === 'always'));
-  const onIface = (p: LocalIn) => p.interfaces.some((i) => i === iface.name || ANY.has(i.toLowerCase()));
-  const inNet = (ip: number, n: Net) => ((ip ^ n.ip) & (n.prefix === 0 ? 0 : (0xffffffff << (32 - n.prefix)) >>> 0)) === 0;
-  /** The policy surely applies to this address (all, or an address object that contains it). */
-  const surelyTo = (p: LocalIn, ip: number | undefined) =>
-    !p.destinationNegate &&
-    (isAll(p.destinations) ||
-      (ip !== undefined &&
-        p.destinations.some((d) => {
-          const n = addresses?.get(d)?.net;
-          return !!n && inNet(ip, n);
-        })));
-  /** The policy may apply to this address (anything not shown to miss it). */
-  const mayBeTo = (p: LocalIn, ip: number | undefined) =>
-    p.destinationNegate ||
-    ip === undefined ||
-    isAll(p.destinations) ||
-    p.destinations.some((d) => {
-      const n = addresses?.get(d)?.net;
-      return !n || inNet(ip, n);
-    });
-  const covers = (p: LocalIn, s: Login) =>
-    !p.serviceNegate &&
-    p.services.some((x) => {
-      const u = x.toUpperCase();
-      return u === 'ALL' || u === 'ALL_TCP' || (u === SERVICE[s].name && (ports[s] ?? SERVICE[s].port) === SERVICE[s].port);
-    });
-  /** May match this service (a negated or unknown service object is taken to). */
-  const mayCover = (p: LocalIn, s: Login) =>
-    p.serviceNegate || p.services.some((x) => !['HTTPS', 'HTTP', 'SSH', 'TELNET'].includes(x.toUpperCase()) || x.toUpperCase() === SERVICE[s].name);
-  if (!where.length) return undefined;
-  const ids: number[] = [];
-  const allowed: string[] = [];
-  for (const { ip, services } of where)
-    for (const s of services) {
-      const idx = live.findIndex((p) => p.action === 'deny' && onIface(p) && surelyTo(p, ip) && covers(p, s) && (p.sourceNegate || isAll(p.sources)));
-      if (idx < 0) return undefined;
-      const deny = live[idx];
-      if (deny.id !== undefined && !ids.includes(deny.id)) ids.push(deny.id);
-      if (deny.sourceNegate) allowed.push(...deny.sources);
-      for (const p of live.slice(0, idx)) {
-        if (p.action !== 'accept' || !onIface(p) || !mayBeTo(p, ip) || !mayCover(p, s)) continue;
-        // An earlier accept from everywhere (or everywhere but a few) leaves it open.
-        if (p.sourceNegate || isAll(p.sources)) return undefined;
-        allowed.push(...p.sources);
-      }
-    }
-  const shown = [...new Set(allowed)].map((a) => {
-    const t = addresses?.get(a)?.text;
-    return t && t !== a ? `${a} (${t})` : a;
-  });
-  return { ids, allowed: shown };
+function denyCandidates(iface: Iface, services: Login[], policies: LocalIn[]): LocalIn[] {
+  const own = new Set(services.map((s) => SERVICE[s].name));
+  const loginNames = new Set(Object.values(SERVICE).map((x) => x.name));
+  return policies.filter(
+    (p) =>
+      p.action === 'deny' &&
+      p.status !== 'disable' &&
+      (!p.interfaces.length || p.interfaces.some((i) => i === iface.name || ANY.has(i.toLowerCase()))) &&
+      (p.serviceNegate || !p.services.length || p.services.some((x) => !loginNames.has(x.toUpperCase()) || own.has(x.toUpperCase())))
+  );
 }
 
 // --- The verdict -------------------------------------------------------------------------------------
@@ -322,6 +278,12 @@ interface Exposure {
   alias?: string;
   wanFacing: string;
   services: string[];
+  /** Each address that allows a sign-in, with its services and ports ("203.0.113.10/30: https (8443), ssh (22)"). */
+  addresses?: string[];
+  /** Who may sign in to it, per account, with the trusted hosts ("any" for none or 0.0.0.0/0). */
+  allowedFrom?: { account: string; type: 'admin' | 'api-user'; trustedHosts: string[]; ipv6TrustedHosts: string[] }[];
+  /** With unknown: the local-in deny policies that may restrict it. */
+  localInCandidates?: Raw[];
   internetManagement: Verdict;
   reason: string;
 }
@@ -388,67 +350,89 @@ async function getAdminAccess(args: Raw, api: Api) {
   const apiUsers = apiGot.ok ? apiGot.res.rows.map(apiUserOf) : [];
 
   // Per WAN-facing interface: is a sign-in reachable from the internet?
+  const showAddr = (a: string) => {
+    const t = addresses?.get(a)?.text;
+    return t && t !== a ? `${a} (${t})` : a;
+  };
+  const portNo = (x: Login) => (g ? (ports[x] ?? SERVICE[x].port) : undefined);
+  const svcPort = (x: Login) => `${x} (${portNo(x) ?? 'port unknown'})`;
+  const andList = (xs: string[]) => (xs.length > 1 ? `${xs.slice(0, -1).join(', ')} and ${xs[xs.length - 1]}` : (xs[0] ?? ''));
+  const quote = (a: Admin) => `${a.apiUser ? 'api-user' : 'admin'} '${a.name}'`;
   const exposures: Exposure[] = [];
   for (const i of ifaces.filter((x) => x.wanFacing)) {
     const v4 = i.management;
     const v6 = i.ipv6Management ?? [];
     const services = [...new Set([...v4, ...v6])];
-    const portOf = (s: Login) => (ports[s] && ports[s] !== SERVICE[s].port ? `${s} (port ${ports[s]})` : s);
-    const base = { interface: i.name, alias: i.alias, wanFacing: i.wanFacing!, services: services.map(portOf) };
-    const say = (internetManagement: Verdict, reason: string) => exposures.push(compact({ ...base, internetManagement, reason }) as Exposure);
+    const portOf = (x: Login) => (ports[x] && ports[x] !== SERVICE[x].port ? `${x} (port ${ports[x]})` : x);
+    const exposed = EXPOSED.get(i) ?? [];
+    const base = {
+      interface: i.name,
+      alias: i.alias,
+      wanFacing: i.wanFacing!,
+      services: services.map(portOf),
+      addresses: exposed.length ? exposed.map((a) => `${a.address}: ${a.services.map(svcPort).join(', ')}`) : undefined,
+    };
+    const rows: Exposure[] = [];
+    const say = (internetManagement: Verdict, reason: string, extra: Partial<Exposure> = {}) => rows.push(compact({ ...base, ...extra, internetManagement, reason }) as Exposure);
     if (!services.length) {
       say('no', `no admin sign-in service (https, http, ssh, telnet) in allowaccess${i.other?.length ? `; allows ${i.other.join(', ')}` : ''}`);
+      exposures.push(...rows);
       continue;
     }
-    const svcText = services.map(portOf).join(', ');
-    // An (IPv4) local-in deny from everywhere limits IPv4 whatever the admins are. IPv6 local-in
-    // policies are not read, so IPv6 sign-ins are judged by the trusted hosts alone.
-    const localKnown = localGot.ok && whole(localGot) && (!named || !!addrGot?.ok);
-    const limit = v4.length && localKnown ? localInLimits(i, policies, addresses, ports) : undefined;
-    const limitText = limit
-      ? `local-in polic${limit.ids.length === 1 ? 'y' : 'ies'} ${limit.ids.join(', ') || '(no id)'} den${limit.ids.length === 1 ? 'ies' : 'y'} IPv4 sign-ins from everywhere${limit.allowed.length ? ` except ${firstN(limit.allowed, 10)}` : ''}`
-      : undefined;
-    if (limit && !v6.length) {
-      say('restricted', `${svcText} allowed, but ${limitText}`);
-      continue;
-    }
-    const open4 = limit ? [] : v4;
-    const pre = limitText ? `${limitText}; on IPv6 ` : '';
-    // Who could sign in: admins for every service, REST API users for https/http.
-    const isWeb = (s: Login) => s === 'https' || s === 'http';
-    const web = open4.some(isWeb) || v6.some(isWeb);
+    // "HTTPS (8443) and SSH (22) on 203.0.113.10"
+    const where = `${andList(services.map((x) => `${x.toUpperCase()} (${portNo(x) ?? 'port unknown'})`))} on ${andList([...new Set(exposed.map((a) => a.address.split('/')[0]))])}`;
+    // Who could sign in: admins for every service, REST API users for https/http. Only trusted hosts
+    // make it "restricted"; a local-in deny that might apply makes an open sign-in "unknown".
+    const isWeb = (x: Login) => x === 'https' || x === 'http';
+    const web = services.some(isWeb);
     const adminsKnown = whole(adminGot);
     const apiKnown = !web || whole(apiGot);
-    const open = (a: Admin) => (open4.length && a.anyIpv4Host) || (v6.length && a.anyIpv6Host);
-    const openAdmins = adminsKnown ? admins.filter(open) : [];
-    const openApi = web && apiKnown ? apiUsers.filter((a) => (open4.some(isWeb) && a.anyIpv4Host) || (v6.some(isWeb) && a.anyIpv6Host)) : [];
-    if (openAdmins.length || openApi.length) {
-      const who = [...openAdmins.map((a) => a.name), ...openApi.map((a) => `${a.name} (REST API)`)];
-      // Open on IPv4 needs the local-in policies read to say "yes".
-      const viaV4 = open4.length > 0 && [...openAdmins, ...openApi].some((a) => a.anyIpv4Host);
-      const viaV6Only = !viaV4;
-      if (viaV4 && !localKnown) {
-        say('unknown', `${svcText} allowed and ${firstN(who, 5)} ha${who.length === 1 ? 's' : 've'} no trusted host, but the local-in policies could not be checked (${localGot.ok ? (whole(localGot) ? `${READ.addresses}: ${addrGot ? failText(addrGot) : 'not read'}` : 'the list was cut') : failText(localGot)})`);
+    const open4 = (a: Admin) => a.anyIpv4Host && (a.apiUser ? v4.some(isWeb) : v4.length > 0);
+    const open6 = (a: Admin) => a.anyIpv6Host && (a.apiUser ? v6.some(isWeb) : v6.length > 0);
+    const accounts = [...(adminsKnown ? admins : []), ...(web && apiKnown ? apiUsers : [])];
+    const allowedFrom = accounts.slice(0, 50).map((a) => ({
+      account: a.name,
+      type: (a.apiUser ? 'api-user' : 'admin') as 'admin' | 'api-user',
+      trustedHosts: a.trustedHosts ?? ['any'],
+      ipv6TrustedHosts: a.ipv6TrustedHosts ?? ['any'],
+    }));
+    const extra = { allowedFrom: allowedFrom.length ? allowedFrom : undefined };
+    const who4 = accounts.filter(open4);
+    const who6 = accounts.filter(open6);
+    const limited = accounts.flatMap((a) => {
+      const hosts = [...(v4.length && !open4(a) ? (a.trustedHosts ?? []) : []), ...(v6.length && !open6(a) ? (a.ipv6TrustedHosts ?? []) : [])];
+      return hosts.length ? [`'${a.name}' limited to ${hosts.join(', ')}`] : [];
+    });
+    const openText = [
+      who4.length ? `open to any address for ${firstN(who4.map(quote), 5)} (no trusted host)` : '',
+      who6.length ? `open to any IPv6 address for ${firstN(who6.map(quote), 5)} (no IPv6 trusted host)` : '',
+    ].filter(Boolean);
+    const story = `${where} ${openText.join('; ')}${limited.length ? `; ${firstN(limited, 5)}` : ''}`;
+    if (who6.length) {
+      // IPv6 local-in policies (local-in-policy6) are not read.
+      say('yes', `${story}; IPv6 local-in policies are not read`, extra);
+    } else if (who4.length) {
+      if (!localGot.ok || !whole(localGot)) {
+        say('unknown', `${story}, but the local-in policies could not be checked (${failText(localGot)})`, extra);
       } else {
-        say(
-          'yes',
-          `${svcText} allowed; ${pre}${firstN(who, 5)} ha${who.length === 1 ? 's' : 've'} no trusted host${viaV6Only ? ' (IPv6; IPv6 local-in policies are not read)' : ', and no local-in policy denies it'}`
-        );
+        const maybe = denyCandidates(i, v4, policies);
+        if (maybe.length) {
+          const ids = maybe.map((p) => (p.id !== undefined ? String(p.id) : '(no id)'));
+          say('unknown', `${story}; but local-in polic${ids.length === 1 ? 'y' : 'ies'} ${firstN(ids, 10)} may restrict this; verify the policy order, schedules and address objects`, {
+            ...extra,
+            localInCandidates: maybe.slice(0, 20).map((p) =>
+              compact({ id: p.id, action: p.action, sources: p.sources.map(showAddr), destinations: p.destinations.map(showAddr), services: p.services, schedule: p.schedule, status: p.status })
+            ),
+          });
+        } else say('yes', `${story}; no local-in deny policy could apply`, extra);
       }
-      continue;
-    }
-    if (!adminsKnown || !apiKnown) {
+    } else if (!adminsKnown || !apiKnown) {
       const missing = [!adminsKnown ? `${READ.admins} (${failText(adminGot)})` : undefined, !apiKnown ? `${READ.apiUsers} (${failText(apiGot)})` : undefined].filter(Boolean);
-      say('unknown', `${svcText} allowed; ${pre}the trusted hosts could not be checked: ${missing.join(' and ')} could not be read in full`);
-      continue;
+      say('unknown', `${where}; the trusted hosts could not be checked: ${missing.join(' and ')} could not be read in full`, extra);
+    } else {
+      say('restricted', accounts.length === 0 ? `${where}, but there are no administrators` : `${where} only from trusted hosts: ${firstN(limited, 10)}`, extra);
     }
-    const hosts = [...new Set([...admins, ...(web ? apiUsers : [])].flatMap((a) => [...(open4.length ? (a.trustedHosts ?? []) : []), ...(v6.length ? (a.ipv6TrustedHosts ?? []) : [])]))];
-    say(
-      'restricted',
-      admins.length + (web ? apiUsers.length : 0) === 0
-        ? `${svcText} allowed, but ${pre}there are no administrators`
-        : `${svcText} allowed, but ${pre}every administrator${web && apiUsers.length ? ' and REST API user' : ''} has trusted hosts: ${firstN(hosts, 10)}`
-    );
+    exposures.push(...rows);
   }
 
   // SNMP.
@@ -494,7 +478,7 @@ async function getAdminAccess(args: Raw, api: Api) {
   const caveats: string[] = [];
   if (!ifGot.ok) caveats.push(`The interfaces could not be read (${failText(ifGot)}), so which interfaces allow management is not known.`);
   else if (!whole(ifGot)) caveats.push('The interface list was cut, so interfaces past the cut are not judged.');
-  if (!globalGot.ok) caveats.push(`The admin settings could not be read (${failText(globalGot)}): the ports are taken as the defaults and telnet as allowed where allowaccess has it.`);
+  if (!globalGot.ok) caveats.push(`The admin settings could not be read (${failText(globalGot)}): the admin ports are not known and telnet is taken as allowed where allowaccess has it.`);
   if (communities?.some((c) => c.pollableFromAnyHost) && ifaces.some((i) => i.wanFacing && (i.other ?? []).includes('snmp')))
     caveats.push('A WAN-facing interface allows snmp and an SNMP community with queries on has no host restriction.');
   if (ifaces.some((i) => i.wanFacing && (i.other ?? []).includes('fgfm'))) caveats.push('fgfm (FortiManager and FortiGate Cloud management) is allowed on a WAN-facing interface; it is not an admin sign-in.');
@@ -527,7 +511,7 @@ async function getAdminAccess(args: Raw, api: Api) {
       text: summaryText,
       internetManagement: exposures,
       caveats,
-      note: 'internetManagement: yes = an admin sign-in service (https, http, ssh, telnet) is allowed on a WAN-facing interface, at least one administrator (or REST API user, for https/http) has no trusted host, and no local-in policy denies it; restricted = every administrator has trusted hosts, or a local-in deny from everywhere covers every allowed sign-in service; no = no sign-in service on that interface; unknown = a read needed for the answer failed or was cut.',
+      note: 'internetManagement: yes = an admin sign-in service (https, http, ssh, telnet) is allowed on a WAN-facing interface, at least one administrator (or REST API user, for https/http) has no trusted host for that address family, and no local-in deny policy could apply; restricted = every administrator (and REST API user, for https/http) has trusted hosts (local-in policies never make it restricted); no = no sign-in service on that interface; unknown = a read needed for the answer failed or was cut, or a local-in deny policy may restrict it (check the policy order, schedules and address objects by hand).',
     }),
     adminSettings: settings ?? sectionError(globalGot),
     interfaces: ifGot.ok
@@ -560,10 +544,7 @@ async function getAdminAccess(args: Raw, api: Api) {
           policies: policies.map((p) =>
             compact({
               ...p,
-              sources: p.sources.map((a) => {
-                const t = addresses?.get(a)?.text;
-                return t && t !== a ? `${a} (${t})` : a;
-              }),
+              sources: p.sources.map(showAddr),
             })
           ),
         })
@@ -579,7 +560,7 @@ export const ADMIN_SPECS: ToolSpec[] = [
   {
     name: 'forticloud_get_admin_access',
     description:
-      "How one FortiGate's management access is exposed, read live from the device through FortiGate Cloud (read-only FortiOS API). summary.internetManagement: per WAN-facing interface (role wan or a public address), whether an admin sign-in is reachable from the internet: yes (https/http/ssh/telnet allowed, an administrator with no trusted host, and no local-in deny), restricted (every administrator has trusted hosts, or a local-in policy denies it from everywhere; the allowed sources are named), no (no sign-in service allowed) or unknown (a read it depends on failed or was cut), with the reason. Also: interfaces with their allowaccess split into sign-in services and others (ping, snmp, fgfm...), the admin settings (HTTPS/HTTP/SSH ports, telnet, HTTPS redirect, idle timeout, lockout, maintainer account), administrators and REST API users (profile, trusted hosts IPv4 and IPv6, two-factor, wildcard, remote group), local-in policies with address names resolved, and SNMP (communities by id with their hosts and query/trap switches; v3 user names and security level). Each read reports on its own when it is not supported, denied (with the HTTP status), rate limited or truncated. Never returns passwords, password hashes, API keys, SSH keys, SNMP community strings or SNMP v3 keys.",
+      "How one FortiGate's management access is exposed, read live from the device through FortiGate Cloud (read-only FortiOS API). summary.internetManagement: per WAN-facing interface (role wan or a public address), whether an admin sign-in is reachable from the internet: yes (https/http/ssh/telnet allowed, an administrator with no trusted host, and no local-in deny that could apply), restricted (every administrator has trusted hosts; local-in policies never make it restricted), no (no sign-in service allowed) or unknown (a read it depends on failed or was cut, or a local-in deny policy may restrict it and needs a check by hand; the policies are named), with the reason, the addresses and ports that allow it, and per account its trusted hosts ('any' when none). Also: interfaces with their allowaccess split into sign-in services and others (ping, snmp, fgfm...), the admin settings (HTTPS/HTTP/SSH ports, telnet, HTTPS redirect, idle timeout, lockout, maintainer account), administrators and REST API users (profile, trusted hosts IPv4 and IPv6, two-factor, wildcard, remote group), local-in policies with address names resolved, and SNMP (communities by id with their hosts and query/trap switches; v3 user names and security level). Each read reports on its own when it is not supported, denied (with the HTTP status), rate limited or truncated. Never returns passwords, password hashes, API keys, SSH keys, SNMP community strings or SNMP v3 keys.",
     params: {
       serial: { type: 'string', description: 'The FortiGate serial number, e.g. FGT60FTK00000000.', required: true, maxLength: 40 },
       vdom: { type: 'string', description: 'The VDOM, on a FortiGate with VDOMs (default: the root VDOM).', maxLength: 31 },

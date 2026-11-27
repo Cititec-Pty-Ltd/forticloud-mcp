@@ -12,8 +12,11 @@ A read-only tool that shows how a FortiGate's management access is exposed.
   serial (and VDOM). `summary.internetManagement` says per WAN-facing
   interface (role wan or a public address) whether an admin sign-in is
   reachable from the internet: yes, restricted (trusted hosts on every
-  administrator, or a local-in deny from everywhere; the sources let in are
-  named), no, or unknown when a read it depends on failed or was cut. Also the
+  account that can sign in; local-in policies never make it restricted), no,
+  or unknown when a read it depends on failed or was cut, or when a local-in
+  deny policy may apply and needs a check by hand. Each entry shows the
+  addresses with their services and ports, the accounts with their trusted
+  hosts ("any" when none) and any local-in candidates. Also the
   interfaces with their allowaccess, the admin ports, telnet, redirect,
   timeout and lockout settings, administrators and REST API users with their
   trusted hosts and two-factor, local-in policies with address names
