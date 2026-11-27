@@ -11,7 +11,7 @@ One FortiCloud **IAM API user** reaches two portals, each with its own OAuth tok
 | Portal | API | Token `client_id` |
 |---|---|---|
 | **FortiGate Cloud** (being renamed FortiManagement Cloud) | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/...` (`/devices`, `/devices/{sn}`, `/devices/{sn}/configbackups/setting`, `/subaccounts`) | `fortigatecloud` |
-| **FortiOS on each FortiGate**, through FortiGate Cloud | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/fgt/{sn}/api/v2/...` (a fixed list of FortiOS `cmdb` and `monitor` reads; see "Network tools", "Routing tool" and "VPN tool") | `fortigatecloud` |
+| **FortiOS on each FortiGate**, through FortiGate Cloud | `GET https://api.fortigate.forticloud.com/forticloudapi/v1/fgt/{sn}/api/v2/...` (a fixed list of FortiOS `cmdb` and `monitor` reads; see "Network tools", "Routing tool", "VPN tool" and "Admin access tool") | `fortigatecloud` |
 | **Asset Management** v3 | `POST https://support.fortinet.com/ES/api/registration/v3/...` with a JSON query (`products/list`, `products/details`, `contracts/list`, `folders/list`) | `assetmanagement` |
 
 - **Tokens:** `POST https://customerapiauth.fortinet.com/api/v1/oauth/token/` (the trailing slash matters) with `{username: <API ID>, password, client_id, grant_type: "password"}`. The token is cached for its `expires_in` less two minutes. A token that FortiCloud rejects early (HTTP 401) is replaced once.
@@ -28,7 +28,7 @@ Fortinet's full API reference (FNDN) needs a login. The endpoints and fields abo
 - a "last seen" time on a device: the public sample has none, so `lastSeen` is filled from any of several likely field names, and `forticloud_get_device` shows every other field the API returns (`otherFields`);
 - a list of config backup revisions: only the automatic backup settings (`configbackups/setting`) are documented;
 - `/subaccounts` (account names), Asset Management's page size (25) and `totalPages`, and the fields `folderPath` and `status` on list items;
-- the FortiOS paths other than `cmdb/system/interface` and `monitor/system/interface` (confirmed through the proxy): they follow the FortiOS 7.0-7.6 REST API reference, as do `include_vlan` and `include_aggregate` on `monitor/system/interface`. The routing reads also need a live check: the answer shapes of `monitor/system/link-monitor` and `monitor/virtual-wan/health-check` (taken as name, then interface, then the counters, and read either way), `monitor/virtual-wan/members` (6.4 and later) and `cmdb/system/virtual-wan-link` on 6.2. The VPN reads too: the phase 2 selector field names on `monitor/vpn/ipsec` (`proxy_src`/`proxy_dst` in the reference, `proxysrc`/`proxydst` as `forticloud_get_network` reads them; `forticloud_get_vpn` keeps both), what `creation_time` counts, the `monitor` field of `phase1-interface` (a name on 6.4, a list on 7.x; read either way), `status` on `cmdb/vpn.ssl/settings` (7.4 and later), and any uptime or prefix count on `monitor/router/bgp/neighbors` (not in the reference);
+- the FortiOS paths other than `cmdb/system/interface` and `monitor/system/interface` (confirmed through the proxy): they follow the FortiOS 7.0-7.6 REST API reference, as do `include_vlan` and `include_aggregate` on `monitor/system/interface`. The routing reads also need a live check: the answer shapes of `monitor/system/link-monitor` and `monitor/virtual-wan/health-check` (taken as name, then interface, then the counters, and read either way), `monitor/virtual-wan/members` (6.4 and later) and `cmdb/system/virtual-wan-link` on 6.2. The VPN reads too: the phase 2 selector field names on `monitor/vpn/ipsec` (`proxy_src`/`proxy_dst` in the reference, `proxysrc`/`proxydst` as `forticloud_get_network` reads them; `forticloud_get_vpn` keeps both), what `creation_time` counts, the `monitor` field of `phase1-interface` (a name on 6.4, a list on 7.x; read either way), `status` on `cmdb/vpn.ssl/settings` (7.4 and later), and any uptime or prefix count on `monitor/router/bgp/neighbors` (not in the reference). The admin access reads too: whether the FortiGate Cloud API user may read `cmdb/system/admin` and `cmdb/system/api-user` (a profile without admin read access gets 403), and the shape of `intf` on `cmdb/firewall/local-in-policy` (a name on older versions, a list on 7.x; read either way);
 - the bodies of 429 answers. The documented quotas: Asset Management **100 calls a minute, 1,000 an hour and 10 errors an hour**; FortiGate Cloud reportedly 100 calls a second and 15 errors a minute.
 
 Every endpoint and `client_id` is a setting, so a change on Fortinet's side needs no new image.
@@ -69,9 +69,10 @@ All URLs must be https.
 | `forticloud_get_network` | One FortiGate's network, read from the device through FortiGate Cloud: interfaces, DHCP servers, routes, VIPs, IPsec VPNs and (when asked) address objects. See "Network tools". |
 | `forticloud_find_ip` | Which client (sub-account), FortiGate, interface and VLAN an IPv4 address or subnet belongs to, across the online FortiGates. |
 | `forticloud_get_vpn` | Whether one FortiGate's IPsec VPN failover is set up right and would take over: per tunnel the phase 1 failover settings (backup of which primary, hold-down, DPD, idle timeout, auto-negotiate, ADVPN), phase 2 selectors, live state (up, partially up, down), and the static routes and BGP neighbors over it; the primary/backup pairs with their problems; one line per remote site; SSL-VPN on or off and users connected. See "VPN tool". |
+| `forticloud_get_admin_access` | How one FortiGate's management access is exposed: per WAN-facing interface whether an admin sign-in is reachable from the internet (yes, restricted, no or unknown) and why; interfaces and their allowaccess, the admin ports and lockout settings, administrators and REST API users with their trusted hosts, local-in policies and SNMP. See "Admin access tool". |
 | `forticloud_get_routing` | How one FortiGate routes and fails over between WANs: static and policy routes, link monitors and SD-WAN (configured and live), every path per destination with its state (like `get router info routing-table database`), and a summary of the failover method and of which path is in use. See "Routing tool". |
 
-16 tools, all read-only.
+17 tools, all read-only.
 
 Lists return `total`, `count`, `offset` and `nextOffset` (Asset Management lists: `totalPages` and `nextPage`), and each response is capped at 60,000 characters. The device list is read once a minute at most and shared by the tools in one session. When FortiGate Cloud does not return the whole device list (paging stops before its advertised total), every result built on it (status, accounts, devices, firmware, config backups, search) carries `complete: false` and a `warning`, so a partial inventory is never presented as the whole fleet.
 
@@ -152,6 +153,29 @@ Two tunnels to one subnet without `monitor` are reported as failover by route di
 
 Reads report on their own exactly as in the routing tool (`unreadable`, `truncatedReads`, `complete: false`, `rateLimited`; after a 429 no further read is started). When the static routes or SD-WAN membership could not be read, "no route" is not claimed; when the live state could not be read, no pair is called healthy. When the live tunnel list was cut, a tunnel missing from it has no `status` (unknown, not down), and a pair with it is not called healthy.
 
+### Admin access tool
+
+`forticloud_get_admin_access` takes a `serial` and an optional `vdom`. It makes 7 FortiOS reads, plus 1 (`cmdb/firewall/address`) when a local-in policy names an address object: 8 at most. `cmdb/system/global` goes first and alone (if the device does not answer, nothing else is tried), then the other six at once, then the address objects when needed.
+
+| Part | Endpoint | Kept |
+|---|---|---|
+| `adminSettings` | `cmdb/system/global` | HTTPS, HTTP, SSH and telnet ports, telnet on or off, HTTP to HTTPS redirect, idle timeout, lockout threshold and duration, maintainer account. Nothing else from `system global`. |
+| `interfaces` | `cmdb/system/interface` | Per interface that allows anything or faces the internet: name, alias, role, type, status, IPv4 (and secondary) address, IPv6 address, `management` (the sign-in services https, http, ssh, telnet allowed on IPv4), `ipv6Management`, `other` (ping, snmp, fgfm and the rest), `wanFacing` (role wan, or a public address). |
+| `administrators` | `cmdb/system/admin` | Name, profile, VDOMs, trusted hosts (IPv4 and IPv6; 0.0.0.0/0 and ::/0 count as none), `anyIpv4Host`/`anyIpv6Host`, two-factor, wildcard, remote group, and `noTrustedHost` (the names). **Never** the password or its hash, SSH public keys or the FortiToken. |
+| `apiUsers` | `cmdb/system/api-user` | Name, profile, VDOMs, trusted hosts. **Never** the API key. |
+| `localInPolicies` | `cmdb/firewall/local-in-policy` (+ `cmdb/firewall/address`) | ID, interfaces, sources (an address resolved as `name (subnet)`), destinations, services, negate switches, action, schedule, status, comment. |
+| `snmp` | `cmdb/system.snmp/community` + `cmdb/system.snmp/user` | Communities by `id` (the community name is the community string, so it is **never** shown), status, query and trap v1/v2c, hosts (IPv4 and IPv6, with interface and type), `pollableFromAnyHost`. v3 users: name, status, security level, queries, query port, trap status, notify hosts. **Never** the authentication or privacy password or protocol. |
+| `summary` | all of the above | A count line; `internetManagement`, one entry per WAN-facing interface (`interface`, `alias`, `wanFacing`, `services`, `internetManagement`, `reason`); caveats. |
+
+`summary.internetManagement` per WAN-facing interface:
+
+- **yes**: a sign-in service (https, http, ssh, telnet; telnet only when `admin-telnet` is not disabled) is allowed, at least one administrator has no trusted host (or, for https/http, a REST API user), and no local-in policy denies it.
+- **restricted**: every administrator (and REST API user, for https/http) has trusted hosts (they are listed), or an enabled, always-on local-in deny on that interface from everywhere (or from everywhere except a negated list) covers every allowed sign-in service; the sources let in are named. A service object covers a sign-in service when it is `ALL`, `ALL_TCP`, or the service's own object (`HTTPS`, `SSH`...) while the admin port is the default.
+- **no**: no sign-in service is allowed on that interface.
+- **unknown**: a read the answer depends on failed (it says why, with the HTTP status) or was cut. "no" or "restricted" is never given on missing data.
+
+Reads report on their own as in the routing tool (`unreadable` with `httpStatus`, `truncatedReads`, `complete: false`, `rateLimited`; after a 429 no further read is started); a section that could not be read shows its read, reason and HTTP status with `note: "unavailable"`. IPv6 local-in policies (`local-in-policy6`) and address groups are not read.
+
 ### Dates and days left
 
 One rule for every tool:
@@ -166,7 +190,7 @@ A FortiGate's host name and description are set on the device by whoever adminis
 
 ### Rate limits
 
-A 429 (or a 503 with a wait) on a read is retried once when the wait is 10 s or less. Otherwise the tool returns an error that says `Try again in N s.` with `structuredContent: { error_type: "rate_limited", retry_after_seconds: N }` (60 s when FortiCloud gives no wait). Every request this server makes is a read: Asset Management's POSTs are queries. Writes would never be retried, but there are none. The Cititec MCP host also applies its own per-service budget. `forticloud_get_routing` and `forticloud_get_vpn` are the exceptions to "a 429 stops the call": once one has read something, it stops asking and returns what it has, with the parts it could not read marked `rate_limited` and the wait in `rateLimited.retryAfterSeconds` (see "Routing tool" and "VPN tool").
+A 429 (or a 503 with a wait) on a read is retried once when the wait is 10 s or less. Otherwise the tool returns an error that says `Try again in N s.` with `structuredContent: { error_type: "rate_limited", retry_after_seconds: N }` (60 s when FortiCloud gives no wait). Every request this server makes is a read: Asset Management's POSTs are queries. Writes would never be retried, but there are none. The Cititec MCP host also applies its own per-service budget. `forticloud_get_routing`, `forticloud_get_vpn` and `forticloud_get_admin_access` are the exceptions to "a 429 stops the call": once one has read something, it stops asking and returns what it has, with the parts it could not read marked `rate_limited` and the wait in `rateLimited.retryAfterSeconds` (see "Routing tool", "VPN tool" and "Admin access tool").
 
 ## Development
 
