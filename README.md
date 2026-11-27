@@ -170,7 +170,7 @@ Reads report on their own exactly as in the routing tool (`unreadable`, `truncat
 `summary.internetManagement` per WAN-facing interface:
 
 - **yes**: a sign-in service (https, http, ssh, telnet; telnet only when `admin-telnet` is not disabled) is allowed, at least one administrator has no trusted host (or, for https/http, a REST API user), and no local-in policy denies it.
-- **restricted**: every administrator (and REST API user, for https/http) has trusted hosts (they are listed), or an enabled, always-on local-in deny on that interface from everywhere (or from everywhere except a negated list) covers every allowed sign-in service; the sources let in are named. A service object covers a sign-in service when it is `ALL`, `ALL_TCP`, or the service's own object (`HTTPS`, `SSH`...) while the admin port is the default.
+- **restricted**: every administrator (and REST API user, for https/http) has trusted hosts (they are listed), or an enabled, always-on local-in deny on that interface from everywhere (or from everywhere except a negated list) covers every IPv4 address and sign-in service it allows, with no earlier accept from everywhere; the sources let in are named. A service object covers a sign-in service when it is `ALL`, `ALL_TCP`, or the service's own object (`HTTPS`, `SSH`...) while the admin port is the default. Local-in policies are IPv4 only here, so IPv6 sign-ins are judged by the IPv6 trusted hosts alone.
 - **no**: no sign-in service is allowed on that interface.
 - **unknown**: a read the answer depends on failed (it says why, with the HTTP status) or was cut. "no" or "restricted" is never given on missing data.
 

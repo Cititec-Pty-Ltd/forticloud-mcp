@@ -1,6 +1,6 @@
 import type { Api } from '../client.js';
 import { checkSerial, timeIn } from './format.js';
-import { isPrivate, networkCidr, parseFortiosNet, parseIpv4, subnetText } from './ip.js';
+import { isPrivate, networkCidr, parseFortiosNet, subnetText } from './ip.js';
 import type { Net } from './ip.js';
 import { checkVdom, cutInfo, deviceInfo } from './network.js';
 import { get, notTried } from './routing.js';
@@ -113,7 +113,12 @@ function buildInterfaces(rows: Raw[], telnetOff: boolean): Iface[] {
               : undefined;
     const other = [...new Set([...all4, ...all6].filter((w) => !isLogin(w)))];
     const v6login = login(all6);
-    return compact({
+    // Which IPv4 address opens which sign-in service (undefined ip: none set, as with DHCP or PPPoE).
+    const where = [
+      { ip: v4?.ip, services: login(words(r.allowaccess)) },
+      ...sec.map((s) => ({ ip: parseFortiosNet(s.ip)?.ip, services: login(words(s.allowaccess)) })),
+    ].filter((a) => a.services.length);
+    const out = compact({
       name: text(r.name, 40) ?? '',
       alias: text(r.alias, 60),
       role,
@@ -127,8 +132,12 @@ function buildInterfaces(rows: Raw[], telnetOff: boolean): Iface[] {
       other: other.length ? other : undefined,
       wanFacing,
     }) as Iface;
+    ADDRESSES.set(out, where);
+    return out;
   });
 }
+/** Per interface, its IPv4 addresses with the sign-in services each allows (kept out of the result). */
+const ADDRESSES = new WeakMap<Iface, { ip?: number; services: Login[] }[]>();
 const ipText = (n: Net) => {
   const ip = [n.ip >>> 24, (n.ip >>> 16) & 255, (n.ip >>> 8) & 255, n.ip & 255].join('.');
   return `${ip}/${n.prefix}`;
@@ -239,43 +248,65 @@ function addressText(r: Raw): string | undefined {
 }
 
 /**
- * Whether the local-in policies stop sign-ins to this interface from the internet: for every service,
- * an enabled, always-on deny on this interface (or any), to all its addresses, from everywhere (or
- * from everywhere except a negated list). Returns the policy ids and who is still let in, or undefined.
+ * Whether the (IPv4) local-in policies stop sign-ins to this interface from the internet: for every
+ * IPv4 address and sign-in service it allows, an enabled, always-on deny on this interface (or any)
+ * to that address, from everywhere (or from everywhere except a negated list), with no earlier accept
+ * that lets everyone in. Returns the policy ids and who is still let in, or undefined.
  */
 function localInLimits(
   iface: Iface,
-  services: Login[],
   policies: LocalIn[],
   addresses: Map<string, { text?: string; net?: Net }> | undefined,
   ports: Record<Login, number | undefined>
 ): { ids: number[]; allowed: string[] } | undefined {
-  const ip = iface.ip ? parseIpv4(iface.ip.split('/')[0]) : undefined;
+  const where = ADDRESSES.get(iface) ?? [];
   const live = policies.filter((p) => p.status !== 'disable' && (!p.schedule || p.schedule === 'always'));
   const onIface = (p: LocalIn) => p.interfaces.some((i) => i === iface.name || ANY.has(i.toLowerCase()));
-  const toIface = (p: LocalIn) =>
+  const inNet = (ip: number, n: Net) => ((ip ^ n.ip) & (n.prefix === 0 ? 0 : (0xffffffff << (32 - n.prefix)) >>> 0)) === 0;
+  /** The policy surely applies to this address (all, or an address object that contains it). */
+  const surelyTo = (p: LocalIn, ip: number | undefined) =>
     !p.destinationNegate &&
     (isAll(p.destinations) ||
-      p.destinations.some((d) => {
-        const n = addresses?.get(d)?.net;
-        return !!n && ip !== undefined && n.prefix <= 32 && ((ip ^ n.ip) & (n.prefix === 0 ? 0 : (0xffffffff << (32 - n.prefix)) >>> 0)) === 0;
-      }));
+      (ip !== undefined &&
+        p.destinations.some((d) => {
+          const n = addresses?.get(d)?.net;
+          return !!n && inNet(ip, n);
+        })));
+  /** The policy may apply to this address (anything not shown to miss it). */
+  const mayBeTo = (p: LocalIn, ip: number | undefined) =>
+    p.destinationNegate ||
+    ip === undefined ||
+    isAll(p.destinations) ||
+    p.destinations.some((d) => {
+      const n = addresses?.get(d)?.net;
+      return !n || inNet(ip, n);
+    });
   const covers = (p: LocalIn, s: Login) =>
     !p.serviceNegate &&
     p.services.some((x) => {
       const u = x.toUpperCase();
       return u === 'ALL' || u === 'ALL_TCP' || (u === SERVICE[s].name && (ports[s] ?? SERVICE[s].port) === SERVICE[s].port);
     });
+  /** May match this service (a negated or unknown service object is taken to). */
+  const mayCover = (p: LocalIn, s: Login) =>
+    p.serviceNegate || p.services.some((x) => !['HTTPS', 'HTTP', 'SSH', 'TELNET'].includes(x.toUpperCase()) || x.toUpperCase() === SERVICE[s].name);
+  if (!where.length) return undefined;
   const ids: number[] = [];
   const allowed: string[] = [];
-  for (const s of services) {
-    const idx = live.findIndex((p) => p.action === 'deny' && onIface(p) && toIface(p) && covers(p, s) && (p.sourceNegate || isAll(p.sources)));
-    if (idx < 0) return undefined;
-    const deny = live[idx];
-    if (deny.id !== undefined && !ids.includes(deny.id)) ids.push(deny.id);
-    if (deny.sourceNegate) allowed.push(...deny.sources);
-    for (const p of live.slice(0, idx)) if (p.action === 'accept' && onIface(p) && covers(p, s) && !p.sourceNegate) allowed.push(...p.sources);
-  }
+  for (const { ip, services } of where)
+    for (const s of services) {
+      const idx = live.findIndex((p) => p.action === 'deny' && onIface(p) && surelyTo(p, ip) && covers(p, s) && (p.sourceNegate || isAll(p.sources)));
+      if (idx < 0) return undefined;
+      const deny = live[idx];
+      if (deny.id !== undefined && !ids.includes(deny.id)) ids.push(deny.id);
+      if (deny.sourceNegate) allowed.push(...deny.sources);
+      for (const p of live.slice(0, idx)) {
+        if (p.action !== 'accept' || !onIface(p) || !mayBeTo(p, ip) || !mayCover(p, s)) continue;
+        // An earlier accept from everywhere (or everywhere but a few) leaves it open.
+        if (p.sourceNegate || isAll(p.sources)) return undefined;
+        allowed.push(...p.sources);
+      }
+    }
   const shown = [...new Set(allowed)].map((a) => {
     const t = addresses?.get(a)?.text;
     return t && t !== a ? `${a} (${t})` : a;
@@ -370,40 +401,53 @@ async function getAdminAccess(args: Raw, api: Api) {
       continue;
     }
     const svcText = services.map(portOf).join(', ');
-    // A local-in deny from everywhere limits it whatever the admins are.
-    const limit = localGot.ok && whole(localGot) && (!named || addrGot?.ok) ? localInLimits(i, services, policies, addresses, ports) : undefined;
-    if (limit) {
-      say('restricted', `${svcText} allowed, but local-in polic${limit.ids.length === 1 ? 'y' : 'ies'} ${limit.ids.join(', ') || '(no id)'} den${limit.ids.length === 1 ? 'ies' : 'y'} it from everywhere${limit.allowed.length ? ` except ${firstN(limit.allowed, 10)}` : ''}`);
+    // An (IPv4) local-in deny from everywhere limits IPv4 whatever the admins are. IPv6 local-in
+    // policies are not read, so IPv6 sign-ins are judged by the trusted hosts alone.
+    const localKnown = localGot.ok && whole(localGot) && (!named || !!addrGot?.ok);
+    const limit = v4.length && localKnown ? localInLimits(i, policies, addresses, ports) : undefined;
+    const limitText = limit
+      ? `local-in polic${limit.ids.length === 1 ? 'y' : 'ies'} ${limit.ids.join(', ') || '(no id)'} den${limit.ids.length === 1 ? 'ies' : 'y'} IPv4 sign-ins from everywhere${limit.allowed.length ? ` except ${firstN(limit.allowed, 10)}` : ''}`
+      : undefined;
+    if (limit && !v6.length) {
+      say('restricted', `${svcText} allowed, but ${limitText}`);
       continue;
     }
+    const open4 = limit ? [] : v4;
+    const pre = limitText ? `${limitText}; on IPv6 ` : '';
     // Who could sign in: admins for every service, REST API users for https/http.
-    const web = services.some((s) => s === 'https' || s === 'http');
+    const isWeb = (s: Login) => s === 'https' || s === 'http';
+    const web = open4.some(isWeb) || v6.some(isWeb);
     const adminsKnown = whole(adminGot);
     const apiKnown = !web || whole(apiGot);
-    const open = (a: Admin) => (v4.length && a.anyIpv4Host) || (v6.length && a.anyIpv6Host);
+    const open = (a: Admin) => (open4.length && a.anyIpv4Host) || (v6.length && a.anyIpv6Host);
     const openAdmins = adminsKnown ? admins.filter(open) : [];
-    const openApi = web && apiKnown ? apiUsers.filter((a) => (v4.some((s) => s === 'https' || s === 'http') && a.anyIpv4Host) || (v6.some((s) => s === 'https' || s === 'http') && a.anyIpv6Host)) : [];
-    const localKnown = localGot.ok && whole(localGot) && (!named || !!addrGot?.ok);
+    const openApi = web && apiKnown ? apiUsers.filter((a) => (open4.some(isWeb) && a.anyIpv4Host) || (v6.some(isWeb) && a.anyIpv6Host)) : [];
     if (openAdmins.length || openApi.length) {
       const who = [...openAdmins.map((a) => a.name), ...openApi.map((a) => `${a.name} (REST API)`)];
-      if (!localKnown) {
+      // Open on IPv4 needs the local-in policies read to say "yes".
+      const viaV4 = open4.length > 0 && [...openAdmins, ...openApi].some((a) => a.anyIpv4Host);
+      const viaV6Only = !viaV4;
+      if (viaV4 && !localKnown) {
         say('unknown', `${svcText} allowed and ${firstN(who, 5)} ha${who.length === 1 ? 's' : 've'} no trusted host, but the local-in policies could not be checked (${localGot.ok ? (whole(localGot) ? `${READ.addresses}: ${addrGot ? failText(addrGot) : 'not read'}` : 'the list was cut') : failText(localGot)})`);
       } else {
-        say('yes', `${svcText} allowed, ${firstN(who, 5)} ha${who.length === 1 ? 's' : 've'} no trusted host, and no local-in policy denies it`);
+        say(
+          'yes',
+          `${svcText} allowed; ${pre}${firstN(who, 5)} ha${who.length === 1 ? 's' : 've'} no trusted host${viaV6Only ? ' (IPv6; IPv6 local-in policies are not read)' : ', and no local-in policy denies it'}`
+        );
       }
       continue;
     }
     if (!adminsKnown || !apiKnown) {
       const missing = [!adminsKnown ? `${READ.admins} (${failText(adminGot)})` : undefined, !apiKnown ? `${READ.apiUsers} (${failText(apiGot)})` : undefined].filter(Boolean);
-      say('unknown', `${svcText} allowed, and the trusted hosts could not be checked: ${missing.join(' and ')} could not be read in full`);
+      say('unknown', `${svcText} allowed; ${pre}the trusted hosts could not be checked: ${missing.join(' and ')} could not be read in full`);
       continue;
     }
-    const hosts = [...new Set([...admins, ...(web ? apiUsers : [])].flatMap((a) => [...(v4.length ? (a.trustedHosts ?? []) : []), ...(v6.length ? (a.ipv6TrustedHosts ?? []) : [])]))];
+    const hosts = [...new Set([...admins, ...(web ? apiUsers : [])].flatMap((a) => [...(open4.length ? (a.trustedHosts ?? []) : []), ...(v6.length ? (a.ipv6TrustedHosts ?? []) : [])]))];
     say(
       'restricted',
       admins.length + (web ? apiUsers.length : 0) === 0
-        ? `${svcText} allowed, but there are no administrators`
-        : `${svcText} allowed, but every administrator${web && apiUsers.length ? ' and REST API user' : ''} has trusted hosts: ${firstN(hosts, 10)}`
+        ? `${svcText} allowed, but ${pre}there are no administrators`
+        : `${svcText} allowed, but ${pre}every administrator${web && apiUsers.length ? ' and REST API user' : ''} has trusted hosts: ${firstN(hosts, 10)}`
     );
   }
 
