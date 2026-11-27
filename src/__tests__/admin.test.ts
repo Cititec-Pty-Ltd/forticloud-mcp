@@ -46,7 +46,7 @@ const apiUser = (name: string, trust: string[] = []) => ({
   accprofile: 'read-only',
   vdom: [{ name: 'root' }],
   'api-key': 'SECRET-apikey-7',
-  trusthost: trust.map((t, i) => ({ id: i + 1, type: 'ipv4-trusthost', 'ipv4-trustip': t, 'ipv6-trustip': '::/0' })),
+  trusthost: trust.map((t, i) => ({ id: i + 1, type: 'ipv4-trusthost', 'ipv4-trusthost': t, 'ipv6-trusthost': '::/0' })),
 });
 
 const BASE: Record<string, Route | Response> = {
@@ -346,6 +346,30 @@ describe('forticloud_get_admin_access', () => {
     expect(fortiosCalls(calls)).toHaveLength(1);
     expect(out.summary.text).toMatch(/^Management exposure unknown/);
     expect(out.summary.internetManagement).toEqual([]);
+  });
+
+  it('a secondary address list cut at the cap: unknown, not no', async () => {
+    const secondary = Array.from({ length: 205 }, (_, n) => ({ id: n + 1, ip: `10.1.${n >> 8}.${n & 255} 255.255.255.255`, allowaccess: n === 204 ? 'https' : 'ping' }));
+    const { fn } = fakeForticloud(
+      routes({ 'cmdb/system/interface': json(envelope([{ name: 'wan1', role: 'wan', ip: '198.51.100.2 255.255.255.252', allowaccess: 'ping', secondaryip: secondary }])) })
+    );
+    setFetchForTests(fn);
+    const out = dataOf(await call({ serial: SN }));
+    expect(wan1(out).internetManagement).toBe('unknown');
+    expect(wan1(out).reason).toMatch(/secondary address list was cut at 200/);
+    expect(out.interfaces.truncated).toBe(true);
+  });
+
+  it('API user trusted hosts are read from ipv4-trusthost (and ipv4-trustip)', () => {
+    const rows = filterFortios(
+      envelope([
+        { name: 'a', trusthost: [{ id: 1, type: 'ipv4-trusthost', 'ipv4-trusthost': '192.0.2.0 255.255.255.0' }] },
+        { name: 'b', trusthost: [{ id: 1, type: 'ipv4-trusthost', 'ipv4-trustip': '192.0.2.0 255.255.255.0' }] },
+      ]),
+      FORTIOS_ENDPOINTS.apiUsers
+    ).rows;
+    expect(rows[0].trusthost).toEqual([{ id: 1, type: 'ipv4-trusthost', 'ipv4-trusthost': '192.0.2.0 255.255.255.0' }]);
+    expect(rows[1].trusthost).toEqual([{ id: 1, type: 'ipv4-trusthost', 'ipv4-trustip': '192.0.2.0 255.255.255.0' }]);
   });
 
   it('allowlists: no secret field is kept, and no allowlisted name looks like one', () => {

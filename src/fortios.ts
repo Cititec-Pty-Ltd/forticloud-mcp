@@ -656,7 +656,8 @@ export const FORTIOS_ENDPOINTS = {
       name: true,
       accprofile: true,
       vdom: { name: true },
-      trusthost: { id: true, type: true, 'ipv4-trustip': true, 'ipv6-trustip': true },
+      // 7.4 reference: ipv4-trusthost / ipv6-trusthost; ipv4-trustip / ipv6-trustip is read too, in case a version uses it.
+      trusthost: { id: true, type: true, 'ipv4-trusthost': true, 'ipv6-trusthost': true, 'ipv4-trustip': true, 'ipv6-trustip': true },
     },
   },
   /** Local-in policies (traffic to the FortiGate itself). */

@@ -1,4 +1,5 @@
 import type { Api } from '../client.js';
+import { MAX_NESTED } from '../fortios.js';
 import { checkSerial, timeIn } from './format.js';
 import { isPrivate, networkCidr, parseFortiosNet, subnetText } from './ip.js';
 import type { Net } from './ip.js';
@@ -139,11 +140,15 @@ function buildInterfaces(rows: Raw[], telnetOff: boolean): Iface[] {
       wanFacing,
     }) as Iface;
     EXPOSED.set(out, exposed);
+    // A secondary address list at the cap may have been cut: an address past it could allow a sign-in.
+    if (sec.length >= MAX_NESTED) CUT.add(out);
     return out;
   });
 }
 /** Per interface, its addresses with the sign-in services each allows (for the verdict rows only). */
 const EXPOSED = new WeakMap<Iface, { address: string; services: Login[] }[]>();
+/** Interfaces whose secondary address list was cut. */
+const CUT = new WeakSet<Iface>();
 const ipText = (n: Net) => {
   const ip = [n.ip >>> 24, (n.ip >>> 16) & 255, (n.ip >>> 8) & 255, n.ip & 255].join('.');
   return `${ip}/${n.prefix}`;
@@ -194,8 +199,8 @@ function adminOf(r: Raw): Admin {
 
 function apiUserOf(r: Raw): Admin {
   const th = list(r.trusthost);
-  const t4 = th.map((t) => trust4(t['ipv4-trustip'])).filter((x): x is string => !!x);
-  const t6 = th.map((t) => trust6(t['ipv6-trustip'])).filter((x): x is string => !!x);
+  const t4 = th.map((t) => trust4(t['ipv4-trusthost'] ?? t['ipv4-trustip'])).filter((x): x is string => !!x);
+  const t6 = th.map((t) => trust6(t['ipv6-trusthost'] ?? t['ipv6-trustip'])).filter((x): x is string => !!x);
   return compact({
     name: text(r.name, 64) ?? '',
     profile: text(r.accprofile, 40),
@@ -373,7 +378,14 @@ async function getAdminAccess(args: Raw, api: Api) {
       addresses: exposed.length ? exposed.map((a) => `${a.address}: ${a.services.map(svcPort).join(', ')}`) : undefined,
     };
     const rows: Exposure[] = [];
-    const say = (internetManagement: Verdict, reason: string, extra: Partial<Exposure> = {}) => rows.push(compact({ ...base, ...extra, internetManagement, reason }) as Exposure);
+    const say = (internetManagement: Verdict, reason: string, extra: Partial<Exposure> = {}) => {
+      // A cut secondary address list could hide a sign-in service: never "no" or "restricted" then.
+      if (CUT.has(i) && (internetManagement === 'no' || internetManagement === 'restricted')) {
+        reason = `${reason}; but the secondary address list was cut at ${MAX_NESTED}, and an address past it may allow a sign-in`;
+        internetManagement = 'unknown';
+      }
+      rows.push(compact({ ...base, ...extra, internetManagement, reason }) as Exposure);
+    };
     if (!services.length) {
       say('no', `no admin sign-in service (https, http, ssh, telnet) in allowaccess${i.other?.length ? `; allows ${i.other.join(', ')}` : ''}`);
       exposures.push(...rows);
